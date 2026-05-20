@@ -28,7 +28,7 @@ def build_case(config) -> Callable[[], object]:
     if config.backend != "npu":
         raise ValueError("vLLM-Ascend fused MoE adapter only supports --backend npu")
 
-    runtime = _init_distributed(torch, dist)
+    runtime = _init_distributed(torch, dist, config.world_size)
     if runtime.world_size != config.world_size:
         raise ValueError(
             f"--world-size={config.world_size} does not match torchrun WORLD_SIZE={runtime.world_size}"
@@ -130,12 +130,18 @@ def build_case(config) -> Callable[[], object]:
     return operation
 
 
-def _init_distributed(torch, dist) -> RuntimeInfo:
+def _init_distributed(torch, dist, expected_world_size: int) -> RuntimeInfo:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.npu.set_device(local_rank)
     if not dist.is_available():
         raise RuntimeError("torch.distributed is not available")
     if not dist.is_initialized():
+        if expected_world_size == 1 and "RANK" not in os.environ:
+            os.environ.setdefault("RANK", "0")
+            os.environ.setdefault("LOCAL_RANK", "0")
+            os.environ.setdefault("WORLD_SIZE", "1")
+            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+            os.environ.setdefault("MASTER_PORT", "29500")
         dist.init_process_group(backend="hccl")
     rank = int(dist.get_rank())
     world_size = int(dist.get_world_size())

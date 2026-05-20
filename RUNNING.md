@@ -140,9 +140,15 @@ DeepGEMM 说明 SM100 需要 CUDA 12.9 或更高版本, PyTorch 通用要求为 
 
 `ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 fusedmoe-test/run_vllm_ascend_fused_moe_a3.py --m 24 --world-size 8 --warmup 20 --repeat 100 --output results/b_vllm_ascend_fused.csv`
 
+单卡 smoke test 可以直接跑, 不会再绕 torchrun:
+
+`ASCEND_RT_VISIBLE_DEVICES=0 python3 fusedmoe-test/run_vllm_ascend_fused_moe_a3.py --m 24 --world-size 1 --num-experts 16 --warmup 2 --repeat 5 --output /tmp/b_smoke.csv`
+
+注意: 单卡 smoke test 不适合沿用 DeepSeek V4 的 `--num-experts 384`, 因为 fused op 的本地 expert 数有 tiling 限制. 单卡只用于验证 op 能被调用, 正式对比仍用 8 卡默认配置.
+
 如果你已经在 torchrun 环境里, 也可以显式运行:
 
-`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 fusedmoe-test/run_vllm_ascend_fused_moe_a3.py --no-torchrun --m 24 --world-size 8 --warmup 20 --repeat 100 --output results/b_vllm_ascend_fused.csv`
+`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc-per-node=8 fusedmoe-test/run_vllm_ascend_fused_moe_a3.py --no-torchrun --m 24 --world-size 8 --warmup 20 --repeat 100 --output results/b_vllm_ascend_fused.csv`
 
 可改参数:
 

@@ -92,6 +92,7 @@ def main() -> int:
 def _should_launch_torchrun(args: argparse.Namespace) -> bool:
     return (
         not args.no_torchrun
+        and args.world_size > 1
         and "RANK" not in os.environ
         and "WORLD_SIZE" not in os.environ
     )
@@ -109,8 +110,10 @@ def _launch_torchrun(args: argparse.Namespace) -> int:
     ]
     cmd = [
         torchrun,
-        "--nproc_per_node",
+        "--no-python",
+        "--nproc-per-node",
         str(args.world_size),
+        sys.executable,
         str(script),
         "--no-torchrun",
         *forwarded,
