@@ -4,7 +4,7 @@
 
 主脚本为:
 
-`python fusedmoe-test/benchmark_moe_dispatch_combine.py`
+`python3 fusedmoe-test/benchmark_moe_dispatch_combine.py`
 
 它提供 3 种模式:
 
@@ -42,9 +42,15 @@
 
 4. 安装与 CANN 9.0.0 和 CPU 架构匹配的 PyTorch 与 torch-npu wheel:
 
-`pip install torch-2.10.1-*.whl`
+vLLM-Ascend `releases/v0.13.0` 的 `requirements.txt` 明确固定:
 
-`pip install torch_npu-2.10.1-*.whl`
+`torch==2.8.0`
+
+`torch-npu==2.8.0.post2`
+
+所以这里不要再手工装 2.10.x. 直接按 vLLM-Ascend 依赖安装, 或安装同版本 wheel:
+
+`pip install torch==2.8.0 torch-npu==2.8.0.post2`
 
 5. 安装 A/B callable 使用的项目 runtime, 通常是匹配分支的 vLLM-Ascend 或 omni-npu: [vllm-ascend/releases/v0.13.0](https://github.com/vllm-project/vllm-ascend/tree/releases/v0.13.0)
 
@@ -54,7 +60,7 @@
 
 6. 验证 NPU:
 
-`python -c "import torch, torch_npu; print(torch.npu.is_available()); print(torch_npu.__version__)"`
+`python3 -c "import torch, torch_npu; print(torch.npu.is_available()); print(torch.__version__); print(torch_npu.__version__)"`
 
 在 A3 上跑 case B 时设置:
 
@@ -114,7 +120,47 @@ DeepGEMM 说明 SM100 需要 CUDA 12.9 或更高版本, PyTorch 通用要求为 
 
 `python fusedmoe-test/benchmark_moe_dispatch_combine.py --case C --mode plan --backend cuda`
 
-## 5. 在 Ascend 上运行 A 和 B
+## 5. 在 Ascend A3 上真实运行 vLLM-Ascend fused MoE
+
+本目录已经提供直接调用 vLLM-Ascend fused MoE 算子的脚本:
+
+`run_vllm_ascend_fused_moe_a3.py`
+
+它会调用:
+
+`torch.ops._C_ascend.dispatch_gmm_combine_decode`
+
+也就是 vLLM-Ascend `VLLM_ASCEND_ENABLE_FUSED_MC2=2` 路径中的 fused MoE decode 算子. 该算子内部覆盖 dispatch, GMM1, dequant, SwiGLU, dynamic quant, GMM2, dequant, combine. benchmark 计时只包住这个 op 调用, 初始化, 造输入, 造权重不进入计时窗口.
+
+先确认 vLLM-Ascend 已经安装并能注册自定义算子:
+
+`python3 -c "import torch, torch_npu; from vllm_ascend.utils import enable_custom_op; print(enable_custom_op()); print(hasattr(torch.ops._C_ascend, 'dispatch_gmm_combine_decode'))"`
+
+一键运行 8 卡 A3:
+
+`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 fusedmoe-test/run_vllm_ascend_fused_moe_a3.py --m 24 --world-size 8 --warmup 20 --repeat 100 --output results/b_vllm_ascend_fused.csv`
+
+如果你已经在 torchrun 环境里, 也可以显式运行:
+
+`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 fusedmoe-test/run_vllm_ascend_fused_moe_a3.py --no-torchrun --m 24 --world-size 8 --warmup 20 --repeat 100 --output results/b_vllm_ascend_fused.csv`
+
+可改参数:
+
+| 参数或环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--m` | `24` | 本 rank 输入 token 数 |
+| `--world-size` | `8` | NPU 数, 必须等于 torchrun 进程数 |
+| `--hidden-size` | `7168` | DeepSeek V4 参考 hidden size |
+| `--moe-intermediate-size` | `3072` | DeepSeek V4 参考 MoE intermediate size |
+| `--num-experts` | `384` | DeepSeek V4 参考 expert 数 |
+| `--num-experts-per-tok` | `6` | top-k |
+| `FMOE_ASCEND_DTYPE` | `bf16` | 可设为 `bf16` 或 `fp16` |
+| `FMOE_ASCEND_QUANT_MODE` | `0` | 传给 fused op 的 quant_mode |
+| `FMOE_ASCEND_WEIGHT_LAYOUT` | `single` | 可设为 `single` 或 `list`; `single` 对应 vLLM 常规非 dynamic EPLB 权重布局 |
+
+脚本在多 rank 下会对每轮 device event 耗时做 `all_reduce(max)`, rank 0 写 CSV. 这是集体通信算子的合理统计方式, 不然拿 rank 0 的单点时间冒充全局时间, 只是更精致的自欺.
+
+## 6. 在 Ascend 上运行自定义 A 和 B
 
 创建一个 adapter module, 例如 `my_moe_adapter.py`, 其中提供:
 
@@ -134,7 +180,7 @@ DeepGEMM 说明 SM100 需要 CUDA 12.9 或更高版本, PyTorch 通用要求为 
 
 B 跑完后, 必须检查日志是否显示命中 fused path. 对 vLLM-Ascend, 这意味着 `VLLM_ASCEND_ENABLE_FUSED_MC2=2`, 且实际调用链到达 `torch.ops._C_ascend.dispatch_gmm_combine_decode`. 
 
-## 6. 在 CUDA 上运行 C
+## 7. 在 CUDA 上运行 C
 
 首选 callable 模式:
 
@@ -146,7 +192,7 @@ B 跑完后, 必须检查日志是否显示命中 fused path. 对 vLLM-Ascend, �
 
 最终对比使用 callable 模式. `deepgemm` 模式只用于证明 CUDA 栈和 DeepGEMM MegaMoE 路径可以启动. 
 
-## 7. 对比结果
+## 8. 对比结果
 
 所有 case 必须使用相同的 `--m`, `--world-size`, 模型字段, warmup, repeat, 权重来源. 
 

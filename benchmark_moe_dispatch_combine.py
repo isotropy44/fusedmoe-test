@@ -195,8 +195,36 @@ def measure_callable(config: BenchConfig) -> list[float]:
         operation()
         end.record()
         synchronize()
-        samples_ms.append(float(start.elapsed_time(end)))
+        samples_ms.append(
+            maybe_reduce_max_elapsed(float(start.elapsed_time(end)), config.backend)
+        )
     return samples_ms
+
+
+def distributed_rank() -> int:
+    try:
+        import torch
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return int(torch.distributed.get_rank())
+    except Exception:
+        return 0
+    return 0
+
+
+def is_primary_rank() -> bool:
+    return distributed_rank() == 0
+
+
+def maybe_reduce_max_elapsed(elapsed_ms: float, backend: str) -> float:
+    import torch
+
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return elapsed_ms
+    device_name = "cuda" if backend == "cuda" else "npu"
+    elapsed = torch.tensor([elapsed_ms], dtype=torch.float32, device=device_name)
+    torch.distributed.all_reduce(elapsed, op=torch.distributed.ReduceOp.MAX)
+    return float(elapsed.cpu().item())
 
 
 def run_deepgemm(config: BenchConfig) -> list[float]:
@@ -319,16 +347,17 @@ def main() -> int:
         else measure_callable(config)
     )
     summary = summarize(samples_ms)
-    write_csv(config, samples_ms, summary)
-    payload = {"config": asdict(config), "summary": summary, "samples_ms": samples_ms}
-    if args.json:
-        print(json.dumps(payload, indent=2, sort_keys=True))
-    else:
-        print(
-            f"case={config.case} backend={config.backend} "
-            f"mean_ms={summary['mean_ms']:.6f} median_ms={summary['median_ms']:.6f} "
-            f"output={config.output}"
-        )
+    if is_primary_rank():
+        write_csv(config, samples_ms, summary)
+        payload = {"config": asdict(config), "summary": summary, "samples_ms": samples_ms}
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print(
+                f"case={config.case} backend={config.backend} "
+                f"mean_ms={summary['mean_ms']:.6f} median_ms={summary['median_ms']:.6f} "
+                f"output={config.output}"
+            )
     return 0
 
 

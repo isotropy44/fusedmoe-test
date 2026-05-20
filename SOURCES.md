@@ -42,35 +42,47 @@
 
   显示 `VLLM_ASCEND_ENABLE_FUSED_MC2=1` 选择 `dispatch_ffn_combine`, `=2` 选择 `dispatch_gmm_combine_decode`. 
 
-3. `vllm-ascend/vllm_ascend/envs.py:130` 到 `:138`
+3. `vllm-ascend/csrc/torch_binding.cpp:566` 到 `:624`, 以及 `:2016` 到 `:2027`
+
+  显示 `dispatch_gmm_combine_decode` 的 Python binding 参数, 返回 `(output, expert_token_nums)`, 并注册到 `torch.ops._C_ascend.dispatch_gmm_combine_decode`.
+
+4. `vllm-ascend/csrc/mc2/dispatch_gmm_combine_decode/op_host/dispatch_gmm_combine_decode_tiling.cpp:88` 到 `:222`
+
+  显示 fused op 对 `x`, `expert_ids`, `gmm1_weight`, `gmm1_scale`, `gmm2_weight`, `gmm2_scale` 的 shape 约束, 并支持单个 3D local expert tensor 或 TensorList.
+
+5. `vllm-ascend/vllm_ascend/envs.py:130` 到 `:138`
 
   说明 `dispatch_gmm_combine_decode` 用于 W8A8 (8-bit Weight, 8-bit Activation) 的 decode node MoE layer. 
 
-4. `vllm-ascend/vllm_ascend/ascend_forward_context.py:257` 到 `:279`
+6. `vllm-ascend/vllm_ascend/ascend_forward_context.py:257` 到 `:279`
 
   显示 A3 fused MC2 selection guard, 以及 fallback 到 MC2 或 ALLTOALL 的逻辑. 
 
-5. `omni-npu/src/omni_npu/layers/fused_moe/layer.py:130` 到 `:155`
+7. `vllm-ascend/vllm_ascend/quantization/w8a8_dynamic.py:292` 到 `:344`
+
+  显示 vLLM-Ascend W8A8 权重在加载后会转置, 转成 `ACL_FORMAT_FRACTAL_NZ`, 并在 dynamic EPLB 下拆成 per expert list.
+
+8. `omni-npu/src/omni_npu/layers/fused_moe/layer.py:130` 到 `:155`
 
   显示 Ascend 普通 MoE 选择 experts 并进入 prepare-permute. 
 
-6. `omni-npu/src/omni_npu/layers/fused_moe/prepare_permute_unpermute_finalize.py:216` 到 `:299`
+9. `omni-npu/src/omni_npu/layers/fused_moe/prepare_permute_unpermute_finalize.py:216` 到 `:299`
 
   显示 AGRS prepare path 使用 EP all-gather 和 `torch_npu.npu_moe_init_routing_v2`. 
 
-7. `omni-npu/src/omni_npu/layers/fused_moe/prepare_permute_unpermute_finalize.py:436` 到 `:457`
+10. `omni-npu/src/omni_npu/layers/fused_moe/prepare_permute_unpermute_finalize.py:436` 到 `:457`
 
   显示普通路径的 finalize routing 和 EP reduce-scatter. 
 
-8. `DeepGEMM/tests/test_mega_moe.py:52` 到 `:57`
+11. `DeepGEMM/tests/test_mega_moe.py:52` 到 `:57`
 
   显示 MegaMoE 的 symmetric memory allocation. 
 
-9. `DeepGEMM/tests/test_mega_moe.py:103` 到 `:121`
+12. `DeepGEMM/tests/test_mega_moe.py:103` 到 `:121`
 
   显示 `deep_gemm.fp8_fp4_mega_moe` 调用. 
 
-10. `DeepGEMM/tests/test_mega_moe.py:157` 到 `:187`
+13. `DeepGEMM/tests/test_mega_moe.py:157` 到 `:187`
 
   显示 legacy CUDA baseline: EP dispatch, grouped GMM, SwiGLU/quant, grouped GMM, EP combine. 
 
