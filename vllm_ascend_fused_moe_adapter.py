@@ -23,6 +23,7 @@ def build_case(config) -> Callable[[], object]:
     import torch
     import torch.distributed as dist
     import torch_npu
+    torch_npu.npu.config.allow_internal_format = True
     from vllm_ascend.utils import enable_custom_op
 
     if config.backend != "npu":
