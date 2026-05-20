@@ -184,6 +184,13 @@ def _validate_config(config) -> None:
         raise ValueError("dispatch_gmm_combine_decode supports num_experts_per_tok <= 12")
     if config.num_experts % config.world_size != 0:
         raise ValueError("num_experts must be divisible by world_size")
+    local_experts = config.num_experts // config.world_size
+    if local_experts > 24:
+        raise ValueError(
+            "dispatch_gmm_combine_decode tiling requires num_experts / world_size <= 24 "
+            f"on A3 (aivNum / 2), got {local_experts}. "
+            "Reduce --num-experts or increase --world-size."
+        )
 
 
 def _rand_int8(torch, shape, device):
