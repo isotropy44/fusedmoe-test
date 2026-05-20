@@ -113,6 +113,7 @@ def _launch_torchrun(args: argparse.Namespace) -> int:
         "--no-python",
         "--nproc-per-node",
         str(args.world_size),
+        "--",
         sys.executable,
         str(script),
         "--no-torchrun",
