@@ -186,31 +186,45 @@ DeepGEMM 说明 SM100 需要 CUDA 12.9 或更高版本, PyTorch 通用要求为 
 
 B 跑完后, 必须检查日志是否显示命中 fused path. 对 vLLM-Ascend, 这意味着 `VLLM_ASCEND_ENABLE_FUSED_MC2=2`, 且实际调用链到达 `torch.ops._C_ascend.dispatch_gmm_combine_decode`. 
 
-## 7. 在 Ascend A3 上运行 Pangu V2 92B decode dispatch-combine
+## 7. 在 Ascend A3 上对比 Pangu V2 92B decode 双路径
 
-本目录提供 Pangu V2 92B decode 场景的 dispatch-combine microbenchmark:
+本目录提供 Pangu V2 92B decode 场景的双路径 microbenchmark:
 
 `run_pangu92_decode_dispatch_combine_benchmark.py`
 
-它只统计下面闭区间:
+默认 `--op-path both`, 会在同一脚本内比较两条路径:
 
 `npu_moe_distribute_dispatch_v2 -> npu_grouped_matmul -> npu_dequant_swiglu_quant -> npu_grouped_matmul -> npu_moe_distribute_combine_v2`
 
+`torch.ops._C_ascend.dispatch_gmm_combine_decode`
+
 不统计 gate, `npu_moe_gating_top_k`, shared expert, final add. `--batch-size` 表示每 rank 当前 MoE 层的 decode token 数, 输入 `hidden_states` shape 为 `[batch_size, hidden_size]`.
 
-单卡 smoke test:
+两条路径复用同一份输入, 同一份权重, 同一份 scale, 同一个 `quant_mode=2`. 默认会在 warmup 和 repeat 前做一次数值一致性检查, 输出转 float32 后计算 `max_abs_diff`, `mean_abs_diff`, `max_rel_diff`, 并用 `rtol=1e-2`, `atol=1e-2` 做 `allclose`. 数值检查不进入计时窗口. 如果数值不一致, 脚本直接失败, 不输出一份看似漂亮但没有意义的时间表.
 
-`ASCEND_RT_VISIBLE_DEVICES=0 python3 fusedmoe-test/run_pangu92_decode_dispatch_combine_benchmark.py --batch-size 24 --world-size 1 --num-experts 16 --synthetic-fallback --warmup 2 --repeat 5 --output /tmp/pangu92_decode_smoke.csv`
+单 rank smoke test:
 
-8 卡 synthetic:
+`ASCEND_RT_VISIBLE_DEVICES=0 python3 fusedmoe-test/run_pangu92_decode_dispatch_combine_benchmark.py --batch-size 24 --world-size 1 --num-experts 16 --op-path both --synthetic-fallback --warmup 2 --repeat 5 --output /tmp/pangu92_compare_smoke.csv`
 
-`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 fusedmoe-test/run_pangu92_decode_dispatch_combine_benchmark.py --batch-size 24 --world-size 8 --synthetic-fallback --warmup 20 --repeat 100 --output results/pangu92_decode_synth.csv`
+A3 8 卡共有 16 die 时, 按 16 个 rank 跑完整 Pangu 92B 256 experts, 每 rank 16 experts:
 
-8 卡真实 92B 权重, 允许失败后回退 synthetic:
+`ASCEND_RT_VISIBLE_DEVICES=0,1,...,15 python3 fusedmoe-test/run_pangu92_decode_dispatch_combine_benchmark.py --batch-size 24 --world-size 16 --op-path both --synthetic-fallback --warmup 20 --repeat 100 --output results/pangu92_decode_compare_synth.csv`
 
-`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 fusedmoe-test/run_pangu92_decode_dispatch_combine_benchmark.py --batch-size 24 --world-size 8 --model-path /path/to/pangu92 --synthetic-fallback --warmup 20 --repeat 100 --output results/pangu92_decode_real.csv`
+16 rank 真实 92B 权重, 允许失败后回退 synthetic:
+
+`ASCEND_RT_VISIBLE_DEVICES=0,1,...,15 python3 fusedmoe-test/run_pangu92_decode_dispatch_combine_benchmark.py --batch-size 24 --world-size 16 --op-path both --model-path /path/to/pangu92 --synthetic-fallback --warmup 20 --repeat 100 --output results/pangu92_decode_compare_real.csv`
 
 若要强制使用真实权重, 去掉 `--synthetic-fallback`. 如果权重 key 或 shape 无法匹配脚本预期, 脚本会直接报错. 这比悄悄换成随机权重诚实一点, 虽然诚实经常不讨人喜欢.
+
+只跑单一路径时使用:
+
+`--op-path pangu`
+
+或:
+
+`--op-path vllm`
+
+单路径模式默认不做数值检查. 如果要跳过双路径数值检查, 显式传 `--no-check-numerics`. 这只适合调试算子能否启动, 不适合拿来做正式对比.
 
 ## 8. 在 CUDA 上运行 C
 

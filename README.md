@@ -24,9 +24,9 @@
 
 `ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 run_vllm_ascend_fused_moe_a3.py --m 24 --world-size 8 --output results/b_vllm_ascend_fused.csv`
 
-在 A3 上测试 Pangu V2 92B decode dispatch-combine:
+在 A3 上对比 Pangu V2 92B decode dispatch-combine 链路和 vLLM-Ascend fused MoE:
 
-`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 run_pangu92_decode_dispatch_combine_benchmark.py --batch-size 24 --world-size 8 --synthetic-fallback --output results/pangu92_decode_synth.csv`
+`ASCEND_RT_VISIBLE_DEVICES=0,1,...,15 python3 run_pangu92_decode_dispatch_combine_benchmark.py --batch-size 24 --world-size 16 --op-path both --synthetic-fallback --output results/pangu92_decode_compare_synth.csv`
 
 接入真实 dispatch-to-combine callable 后运行 A/B/C:
 

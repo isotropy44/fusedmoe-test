@@ -52,6 +52,10 @@ class BenchConfig:
     synthetic_fallback: bool
     layer_index: int
     seed: int
+    op_path: str
+    check_numerics: bool
+    rtol: float
+    atol: float
 
 
 @dataclass(frozen=True)
@@ -68,7 +72,7 @@ def parse_args() -> argparse.Namespace:
         description="Measure Pangu V2 92B decode MoE dispatch-combine closed interval."
     )
     parser.add_argument("--batch-size", type=int, default=24)
-    parser.add_argument("--world-size", type=int, default=8)
+    parser.add_argument("--world-size", type=int, default=16)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--output", default="results/pangu92_decode_dispatch_combine.csv")
@@ -81,6 +85,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-size", type=int, default=None)
     parser.add_argument("--moe-intermediate-size", type=int, default=None)
     parser.add_argument("--num-experts", type=int, default=None)
+    parser.add_argument("--op-path", choices=["pangu", "vllm", "both"], default="both")
+    parser.add_argument(
+        "--check-numerics",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Compare Pangu chain and vLLM fused outputs before timed measurement.",
+    )
+    parser.add_argument("--rtol", type=float, default=1e-2)
+    parser.add_argument("--atol", type=float, default=1e-2)
     parser.add_argument(
         "--no-torchrun",
         action="store_true",
@@ -95,18 +108,19 @@ def main() -> int:
         return _launch_torchrun(args)
 
     cfg = resolve_config(args)
+    validate_config(cfg)
 
     import torch
     import torch.distributed as dist
     import torch_npu
 
     torch_npu.npu.config.allow_internal_format = True
+    ensure_vllm_custom_op(torch, cfg)
     runtime = init_distributed(torch, dist, cfg.world_size)
     if runtime.world_size != cfg.world_size:
         raise ValueError(
             f"--world-size={cfg.world_size} does not match WORLD_SIZE={runtime.world_size}"
         )
-    validate_config(cfg)
     device = torch.device(f"npu:{runtime.local_rank}")
 
     weights = build_weights(torch, torch_npu, cfg, runtime, device)
@@ -120,33 +134,65 @@ def main() -> int:
 
     if runtime.rank == 0:
         print(
-            "pangu92 decode dispatch-combine benchmark: "
+            "pangu92 decode MoE benchmark: "
             f"batch_size={cfg.batch_size} h={cfg.hidden_size} "
             f"inter={cfg.moe_intermediate_size} experts={cfg.num_experts} "
             f"top_k={cfg.top_k} world_size={cfg.world_size} "
+            f"quant_mode={cfg.quant_mode} op_path={cfg.op_path} "
             f"weight_source={weights.source}"
         )
 
-    operation = make_operation(torch, torch_npu, cfg, runtime, weights,
-                               hidden_states, topk_ids, topk_weights,
-                               quant_scale)
-    samples_ms = measure(torch, cfg, operation)
-    summary = summarize(samples_ms)
+    operations = build_operations(
+        torch,
+        torch_npu,
+        cfg,
+        runtime,
+        weights,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        quant_scale,
+    )
+    numerics = maybe_check_numerics(torch, cfg, operations)
+    if numerics["checked"] and not numerics["allclose"]:
+        if is_primary_rank(torch):
+            write_numerics_failure_csv(cfg, weights.source, numerics)
+        raise RuntimeError(
+            "numerics check failed: "
+            f"max_abs_diff={numerics['max_abs_diff']:.8g}, "
+            f"mean_abs_diff={numerics['mean_abs_diff']:.8g}, "
+            f"max_rel_diff={numerics['max_rel_diff']:.8g}, "
+            f"rtol={cfg.rtol}, atol={cfg.atol}"
+        )
+    results: dict[str, dict[str, object]] = {}
+    for op_name, operation in operations.items():
+        samples_ms = measure(torch, cfg, operation)
+        summary = summarize(samples_ms)
+        results[op_name] = {
+            "samples_ms": samples_ms,
+            "summary": summary,
+        }
     if is_primary_rank(torch):
-        write_csv(cfg, weights.source, samples_ms, summary)
+        write_csv(cfg, weights.source, results, numerics)
         payload = {
             "config": asdict(cfg),
             "weight_source": weights.source,
-            "summary": summary,
-            "samples_ms": samples_ms,
+            "numerics": numerics,
+            "results": results,
         }
         if args.json:
             print(json.dumps(payload, indent=2, sort_keys=True))
         else:
+            parts = []
+            for op_name, result in results.items():
+                summary = result["summary"]
+                parts.append(
+                    f"{op_name}:mean_ms={summary['mean_ms']:.6f},"
+                    f"median_ms={summary['median_ms']:.6f}"
+                )
             print(
                 f"model=pangu_v2_moe_92B backend=npu "
-                f"mean_ms={summary['mean_ms']:.6f} "
-                f"median_ms={summary['median_ms']:.6f} output={cfg.output}"
+                f"{' '.join(parts)} output={cfg.output}"
             )
     return 0
 
@@ -188,6 +234,13 @@ def resolve_config(args: argparse.Namespace) -> BenchConfig:
         synthetic_fallback=args.synthetic_fallback,
         layer_index=args.layer_index,
         seed=args.seed,
+        op_path=args.op_path,
+        check_numerics=(
+            args.check_numerics if args.check_numerics is not None
+            else args.op_path == "both"
+        ),
+        rtol=args.rtol,
+        atol=args.atol,
     )
 
 
@@ -222,6 +275,59 @@ def validate_config(cfg: BenchConfig) -> None:
         raise ValueError("--top-k must be >= 1")
     if cfg.top_k > cfg.num_experts:
         raise ValueError("--top-k must be <= --num-experts")
+    if cfg.check_numerics and cfg.op_path != "both":
+        raise ValueError("--check-numerics requires --op-path both")
+    if cfg.rtol < 0 or cfg.atol < 0:
+        raise ValueError("--rtol and --atol must be >= 0")
+    if cfg.op_path in {"vllm", "both"}:
+        validate_vllm_fused_config(cfg)
+
+
+def validate_vllm_fused_config(cfg: BenchConfig) -> None:
+    gmm1_hidden = 2 * cfg.moe_intermediate_size
+    local_experts = cfg.num_experts // cfg.world_size
+    if cfg.batch_size > 256:
+        raise ValueError("dispatch_gmm_combine_decode supports --batch-size <= 256")
+    if cfg.hidden_size < 512 or cfg.hidden_size > 7168:
+        raise ValueError("dispatch_gmm_combine_decode supports 512 <= hidden_size <= 7168")
+    if gmm1_hidden < 1024 or gmm1_hidden > 6144:
+        raise ValueError(
+            "dispatch_gmm_combine_decode supports "
+            "1024 <= 2 * moe_intermediate_size <= 6144"
+        )
+    if cfg.num_experts > 512:
+        raise ValueError("dispatch_gmm_combine_decode supports num_experts <= 512")
+    if cfg.top_k > 12:
+        raise ValueError("dispatch_gmm_combine_decode supports top_k <= 12")
+    if local_experts > 24:
+        raise ValueError(
+            "dispatch_gmm_combine_decode tiling requires "
+            "num_experts / world_size <= 24 on A3, got "
+            f"{local_experts}. Use 16 ranks for full Pangu 92B 256 experts."
+        )
+
+
+def ensure_vllm_custom_op(torch, cfg: BenchConfig) -> None:
+    if cfg.op_path not in {"vllm", "both"}:
+        return
+    try:
+        from vllm_ascend.utils import enable_custom_op
+    except ImportError as exc:
+        raise RuntimeError(
+            "vLLM-Ascend is required for --op-path vllm or both. "
+            "Install vllm-ascend in the current environment."
+        ) from exc
+    if not enable_custom_op():
+        raise RuntimeError(
+            "vLLM-Ascend custom ops are not registered. "
+            "Build and install vllm-ascend first."
+        )
+    if not hasattr(torch.ops, "_C_ascend") or not hasattr(
+        torch.ops._C_ascend, "dispatch_gmm_combine_decode"
+    ):
+        raise RuntimeError(
+            "torch.ops._C_ascend.dispatch_gmm_combine_decode is unavailable."
+        )
 
 
 def _should_launch_torchrun(args: argparse.Namespace) -> bool:
@@ -563,7 +669,44 @@ def to_nz(torch_npu, tensor):
     return torch_npu.npu_format_cast(tensor, ACL_FORMAT_FRACTAL_NZ)
 
 
-def make_operation(
+def build_operations(
+    torch,
+    torch_npu,
+    cfg: BenchConfig,
+    runtime: RuntimeInfo,
+    weights: Weights,
+    hidden_states,
+    topk_ids,
+    topk_weights,
+    quant_scale,
+):
+    operations = {}
+    if cfg.op_path in {"pangu", "both"}:
+        operations["pangu_chain"] = make_pangu_operation(
+            torch,
+            torch_npu,
+            cfg,
+            runtime,
+            weights,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            quant_scale,
+        )
+    if cfg.op_path in {"vllm", "both"}:
+        operations["vllm_fused"] = make_vllm_fused_operation(
+            torch,
+            cfg,
+            runtime,
+            weights,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+        )
+    return operations
+
+
+def make_pangu_operation(
     torch,
     torch_npu,
     cfg: BenchConfig,
@@ -653,6 +796,97 @@ def make_operation(
     return operation
 
 
+def make_vllm_fused_operation(
+    torch,
+    cfg: BenchConfig,
+    runtime: RuntimeInfo,
+    weights: Weights,
+    hidden_states,
+    topk_ids,
+    topk_weights,
+):
+    gmm1_scale = weights.w13_weight_scale.to(torch.float32)
+    gmm2_scale = weights.w2_weight_scale.to(torch.float32)
+
+    def operation():
+        output, _expert_token_nums = torch.ops._C_ascend.dispatch_gmm_combine_decode(
+            x=hidden_states,
+            expert_ids=topk_ids,
+            gmm1_permuted_weight=[weights.w13_weight],
+            gmm1_permuted_weight_scale=[gmm1_scale],
+            gmm2_weight=[weights.w2_weight],
+            gmm2_weight_scale=[gmm2_scale],
+            expert_scales=topk_weights.to(torch.float32),
+            expert_smooth_scales=None,
+            x_active_mask=None,
+            group_ep=runtime.group_ep,
+            ep_rank_size=runtime.world_size,
+            ep_rank_id=runtime.rank,
+            moe_expert_num=cfg.num_experts,
+            shared_expert_num=1,
+            shared_expert_rank_num=0,
+            quant_mode=cfg.quant_mode,
+            global_bs=cfg.batch_size * runtime.world_size,
+        )
+        return output
+
+    return operation
+
+
+def maybe_check_numerics(torch, cfg: BenchConfig, operations) -> dict[str, object]:
+    if not cfg.check_numerics:
+        return {
+            "checked": False,
+            "allclose": None,
+            "max_abs_diff": None,
+            "mean_abs_diff": None,
+            "max_rel_diff": None,
+        }
+    pangu_output = unwrap_output(run_once_synced(torch, operations["pangu_chain"]))
+    vllm_output = unwrap_output(run_once_synced(torch, operations["vllm_fused"]))
+    torch.npu.synchronize()
+    if tuple(pangu_output.shape) != tuple(vllm_output.shape):
+        raise RuntimeError(
+            "numerics check failed: output shape mismatch "
+            f"pangu={tuple(pangu_output.shape)} vllm={tuple(vllm_output.shape)}"
+        )
+    pangu_f32 = pangu_output.to(torch.float32)
+    vllm_f32 = vllm_output.to(torch.float32)
+    abs_diff = (pangu_f32 - vllm_f32).abs()
+    rel_diff = abs_diff / torch.maximum(
+        pangu_f32.abs(), torch.tensor(cfg.atol, dtype=torch.float32, device=pangu_f32.device)
+    )
+    max_abs_diff = reduce_max_scalar(torch, float(abs_diff.max().detach().cpu().item()))
+    mean_abs_diff = reduce_max_scalar(torch, float(abs_diff.mean().detach().cpu().item()))
+    max_rel_diff = reduce_max_scalar(torch, float(rel_diff.max().detach().cpu().item()))
+    local_allclose = bool(
+        torch.allclose(pangu_f32, vllm_f32, rtol=cfg.rtol, atol=cfg.atol)
+    )
+    global_failure = reduce_max_scalar(torch, 0.0 if local_allclose else 1.0)
+    allclose = global_failure == 0.0
+    result = {
+        "checked": True,
+        "allclose": allclose,
+        "max_abs_diff": max_abs_diff,
+        "mean_abs_diff": mean_abs_diff,
+        "max_rel_diff": max_rel_diff,
+    }
+    return result
+
+
+def run_once_synced(torch, operation):
+    torch.npu.synchronize()
+    output = operation()
+    torch.npu.synchronize()
+    return output
+
+
+def unwrap_output(output):
+    if isinstance(output, (tuple, list)):
+        return output[0]
+    return output
+
+
 def measure(torch, cfg: BenchConfig, operation) -> list[float]:
     for _ in range(cfg.warmup):
         operation()
@@ -672,11 +906,15 @@ def measure(torch, cfg: BenchConfig, operation) -> list[float]:
 
 
 def maybe_reduce_max_elapsed(torch, elapsed_ms: float) -> float:
+    return reduce_max_scalar(torch, elapsed_ms)
+
+
+def reduce_max_scalar(torch, value: float) -> float:
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        return elapsed_ms
-    elapsed = torch.tensor([elapsed_ms], dtype=torch.float32, device="npu")
-    torch.distributed.all_reduce(elapsed, op=torch.distributed.ReduceOp.MAX)
-    return float(elapsed.cpu().item())
+        return value
+    tensor = torch.tensor([value], dtype=torch.float32, device="npu")
+    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX)
+    return float(tensor.cpu().item())
 
 
 def is_primary_rank(torch) -> bool:
@@ -704,8 +942,8 @@ def summarize(samples_ms: list[float]) -> dict[str, float]:
 def write_csv(
     cfg: BenchConfig,
     weight_source: str,
-    samples_ms: list[float],
-    summary: dict[str, float],
+    results: dict[str, dict[str, object]],
+    numerics: dict[str, object],
 ) -> None:
     output = Path(cfg.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -721,8 +959,14 @@ def write_csv(
         "local_experts",
         "top_k",
         "quant_mode",
+        "op_path",
         "weight_source",
         "layer_index",
+        "numerics_checked",
+        "numerics_allclose",
+        "max_abs_diff",
+        "mean_abs_diff",
+        "max_rel_diff",
         "sample_ms",
         "count",
         "mean_ms",
@@ -736,8 +980,77 @@ def write_csv(
         writer = csv.DictWriter(f, fieldnames=fields)
         if not exists:
             writer.writeheader()
-        for sample in samples_ms:
-            row: dict[str, object] = {
+        for op_path, result in results.items():
+            samples_ms = result["samples_ms"]
+            summary = result["summary"]
+            for sample in samples_ms:
+                row: dict[str, object] = {
+                    "model": "pangu_v2_moe_92B",
+                    "scenario": "decode",
+                    "batch_size": cfg.batch_size,
+                    "world_size": cfg.world_size,
+                    "hidden_size": cfg.hidden_size,
+                    "moe_intermediate_size": cfg.moe_intermediate_size,
+                    "num_experts": cfg.num_experts,
+                    "local_experts": cfg.num_experts // cfg.world_size,
+                    "top_k": cfg.top_k,
+                    "quant_mode": cfg.quant_mode,
+                    "op_path": op_path,
+                    "weight_source": weight_source,
+                    "layer_index": cfg.layer_index,
+                    "numerics_checked": numerics["checked"],
+                    "numerics_allclose": numerics["allclose"],
+                    "max_abs_diff": numerics["max_abs_diff"],
+                    "mean_abs_diff": numerics["mean_abs_diff"],
+                    "max_rel_diff": numerics["max_rel_diff"],
+                    "sample_ms": sample,
+                }
+                row.update(summary)
+                writer.writerow(row)
+
+
+def write_numerics_failure_csv(
+    cfg: BenchConfig,
+    weight_source: str,
+    numerics: dict[str, object],
+) -> None:
+    output = Path(cfg.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    exists = output.exists()
+    fields = [
+        "model",
+        "scenario",
+        "batch_size",
+        "world_size",
+        "hidden_size",
+        "moe_intermediate_size",
+        "num_experts",
+        "local_experts",
+        "top_k",
+        "quant_mode",
+        "op_path",
+        "weight_source",
+        "layer_index",
+        "numerics_checked",
+        "numerics_allclose",
+        "max_abs_diff",
+        "mean_abs_diff",
+        "max_rel_diff",
+        "sample_ms",
+        "count",
+        "mean_ms",
+        "median_ms",
+        "min_ms",
+        "max_ms",
+        "p90_ms",
+        "p99_ms",
+    ]
+    with output.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        if not exists:
+            writer.writeheader()
+        writer.writerow(
+            {
                 "model": "pangu_v2_moe_92B",
                 "scenario": "decode",
                 "batch_size": cfg.batch_size,
@@ -748,12 +1061,24 @@ def write_csv(
                 "local_experts": cfg.num_experts // cfg.world_size,
                 "top_k": cfg.top_k,
                 "quant_mode": cfg.quant_mode,
+                "op_path": "numerics_check",
                 "weight_source": weight_source,
                 "layer_index": cfg.layer_index,
-                "sample_ms": sample,
+                "numerics_checked": numerics["checked"],
+                "numerics_allclose": numerics["allclose"],
+                "max_abs_diff": numerics["max_abs_diff"],
+                "mean_abs_diff": numerics["mean_abs_diff"],
+                "max_rel_diff": numerics["max_rel_diff"],
+                "sample_ms": "",
+                "count": "",
+                "mean_ms": "",
+                "median_ms": "",
+                "min_ms": "",
+                "max_ms": "",
+                "p90_ms": "",
+                "p99_ms": "",
             }
-            row.update(summary)
-            writer.writerow(row)
+        )
 
 
 if __name__ == "__main__":
