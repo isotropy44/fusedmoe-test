@@ -186,7 +186,33 @@ DeepGEMM 说明 SM100 需要 CUDA 12.9 或更高版本, PyTorch 通用要求为 
 
 B 跑完后, 必须检查日志是否显示命中 fused path. 对 vLLM-Ascend, 这意味着 `VLLM_ASCEND_ENABLE_FUSED_MC2=2`, 且实际调用链到达 `torch.ops._C_ascend.dispatch_gmm_combine_decode`. 
 
-## 7. 在 CUDA 上运行 C
+## 7. 在 Ascend A3 上运行 Pangu V2 92B decode dispatch-combine
+
+本目录提供 Pangu V2 92B decode 场景的 dispatch-combine microbenchmark:
+
+`run_pangu92_decode_dispatch_combine_benchmark.py`
+
+它只统计下面闭区间:
+
+`npu_moe_distribute_dispatch_v2 -> npu_grouped_matmul -> npu_dequant_swiglu_quant -> npu_grouped_matmul -> npu_moe_distribute_combine_v2`
+
+不统计 gate, `npu_moe_gating_top_k`, shared expert, final add. `--batch-size` 表示每 rank 当前 MoE 层的 decode token 数, 输入 `hidden_states` shape 为 `[batch_size, hidden_size]`.
+
+单卡 smoke test:
+
+`ASCEND_RT_VISIBLE_DEVICES=0 python3 fusedmoe-test/run_pangu92_decode_dispatch_combine_benchmark.py --batch-size 24 --world-size 1 --num-experts 16 --synthetic-fallback --warmup 2 --repeat 5 --output /tmp/pangu92_decode_smoke.csv`
+
+8 卡 synthetic:
+
+`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 fusedmoe-test/run_pangu92_decode_dispatch_combine_benchmark.py --batch-size 24 --world-size 8 --synthetic-fallback --warmup 20 --repeat 100 --output results/pangu92_decode_synth.csv`
+
+8 卡真实 92B 权重, 允许失败后回退 synthetic:
+
+`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 fusedmoe-test/run_pangu92_decode_dispatch_combine_benchmark.py --batch-size 24 --world-size 8 --model-path /path/to/pangu92 --synthetic-fallback --warmup 20 --repeat 100 --output results/pangu92_decode_real.csv`
+
+若要强制使用真实权重, 去掉 `--synthetic-fallback`. 如果权重 key 或 shape 无法匹配脚本预期, 脚本会直接报错. 这比悄悄换成随机权重诚实一点, 虽然诚实经常不讨人喜欢.
+
+## 8. 在 CUDA 上运行 C
 
 首选 callable 模式:
 
@@ -198,7 +224,7 @@ B 跑完后, 必须检查日志是否显示命中 fused path. 对 vLLM-Ascend, �
 
 最终对比使用 callable 模式. `deepgemm` 模式只用于证明 CUDA 栈和 DeepGEMM MegaMoE 路径可以启动. 
 
-## 8. 对比结果
+## 9. 对比结果
 
 所有 case 必须使用相同的 `--m`, `--world-size`, 模型字段, warmup, repeat, 权重来源. 
 

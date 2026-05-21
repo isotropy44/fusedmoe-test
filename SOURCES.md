@@ -86,6 +86,18 @@
 
   显示 legacy CUDA baseline: EP dispatch, grouped GMM, SwiGLU/quant, grouped GMM, EP combine. 
 
+14. `/Users/jhyang/workcode/omni-npu/src/omni_npu/model_config/configs/match_hf_configs.json:247` 到 `:255`
+
+  显示 Pangu V2 92B 配置: `hidden_size=2560`, `n_routed_experts=256`, `n_shared_experts=1`, `moe_intermediate_size=1024`.
+
+15. `/Users/jhyang/workcode/omni-models/omni_models/models/pangu_v2/pangu_v2_moe.py:818` 到 `:956`
+
+  显示 Pangu V2 dispatch-combine 单 batch 路径: `npu_moe_distribute_dispatch_v2`, 量化 `npu_grouped_matmul`, `npu_dequant_swiglu_quant`, 第二次 `npu_grouped_matmul`, `npu_moe_distribute_combine_v2`.
+
+16. `/Users/jhyang/workcode/omni-npu/src/omni_npu/layers/quantization/compressed_tensors/compressed_tensors_moe.py:89` 到 `:186`
+
+  显示 W8A8 MoE 权重原始 shape, 加载后转置, NZ 格式转换, 以及 scale squeeze 后的 dtype 处理.
+
 ## 3. 假设
 
 1. Benchmark 使用 DeepSeek V4 Pro Base shape 作为公共 proxy, 不使用 Pangu V2 shape.
