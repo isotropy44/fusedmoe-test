@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib
 import json
 import os
 import shutil
@@ -322,12 +323,28 @@ def ensure_vllm_custom_op(torch, cfg: BenchConfig) -> None:
             "vLLM-Ascend custom ops are not registered. "
             "Build and install vllm-ascend first."
         )
+    load_vllm_ascend_extension()
     if not hasattr(torch.ops, "_C_ascend") or not hasattr(
         torch.ops._C_ascend, "dispatch_gmm_combine_decode"
     ):
         raise RuntimeError(
-            "torch.ops._C_ascend.dispatch_gmm_combine_decode is unavailable."
+            "torch.ops._C_ascend.dispatch_gmm_combine_decode is unavailable after "
+            "enable_custom_op() and importing vllm_ascend.vllm_ascend_C. "
+            "For A3, rebuild vllm-ascend with SOC_VERSION=ascend910_93 and source "
+            "the generated _cann_ops_custom set_env.bash. A2 ascend910b1 builds do "
+            "not package this fused decode ACLNN op."
         )
+
+
+def load_vllm_ascend_extension() -> None:
+    try:
+        importlib.import_module("vllm_ascend.vllm_ascend_C")
+    except ImportError as exc:
+        raise RuntimeError(
+            "Failed to import vllm_ascend.vllm_ascend_C. The Python package may be "
+            "installed, but the C++ extension that registers torch.ops._C_ascend "
+            "is not loaded."
+        ) from exc
 
 
 def _should_launch_torchrun(args: argparse.Namespace) -> bool:

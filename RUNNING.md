@@ -1,14 +1,14 @@
 # A2 / A3 NPU 运行说明
 
-本文面向第一次接触 NPU (Neural Processing Unit) 的用户.目标不是优雅, 是让你能把实验跑起来, 并且知道每一步失败时该看哪里.
+本文面向第一次接触 NPU (Neural Processing Unit) 的用户. 目标不是优雅, 是让你能把实验跑起来, 并且知道每一步失败时该看哪里.
 
 ## 1. 基本概念
 
-NPU 是昇腾 AI 处理器.A2 和 A3 是不同机器平台.A2 这次只做预验证, A3 做正式性能结论.
+NPU 是昇腾 AI 处理器. A2 和 A3 是不同机器平台. A2 这次只做预验证, A3 做正式性能结论.
 
-rank 是分布式进程编号.8 rank 表示启动 8 个进程.A3 8 卡通常可以按 16 die 暴露为 16 rank.MoE (Mixture of Experts) 的 expert 会按 rank 切分, 所以 `num_experts / world_size` 是每 rank 本地 expert 数.
+rank 是分布式进程编号. 8 rank 表示启动 8 个进程. A3 8 卡通常可以按 16 die 暴露为 16 rank. MoE (Mixture of Experts) 的 expert 会按 rank 切分, 所以 `num_experts / world_size` 是每 rank 本地 expert 数.
 
-EP (Expert Parallel) 是 expert 并行域.实验要求 3 个 case 的 `world_size`, rank 映射, `ASCEND_RT_VISIBLE_DEVICES`, `num_experts`, `top_k`, `quant_mode` 一致.不同进程里的 `group_ep` 字符串不要求相同, 只要求当前环境可创建并可用.
+EP (Expert Parallel) 是 expert 并行域. 实验要求 3 个 case 的 `world_size`, rank 映射, `ASCEND_RT_VISIBLE_DEVICES`, `num_experts`, `top_k`, `quant_mode` 一致. 不同进程里的 `group_ep` 字符串不要求相同, 只要求当前环境可创建并可用.
 
 ## 2. 推荐版本
 
@@ -24,7 +24,7 @@ vLLM-Ascend `releases/v0.18.0` 按官方安装文档使用:
 | vLLM | v0.18.0 |
 | vLLM-Ascend | releases/v0.18.0 |
 
-先按这些版本跑通.不要一上来就混版本, 那不是自由, 是噪声.
+先按这些版本跑通. 不要一上来就混版本, 那不是自由, 是噪声.
 
 ## 3. root 登录后检查机器
 
@@ -36,7 +36,7 @@ root 登录:
 
 `npu-smi info`
 
-如果这里看不到卡, 不要继续装 Python 包.先处理 driver, firmware, device 权限.
+如果这里看不到卡, 不要继续装 Python 包. 先处理 driver, firmware, device 权限.
 
 ## 4. 创建个人用户
 
@@ -74,7 +74,7 @@ Ubuntu 常见命令:
 
 `cd /home/jhyang/Ascend/downloads`
 
-下载 CANN 包.文件名会随 CPU 架构不同而变化, 常见架构是 `x86_64` 或 `aarch64`:
+下载 CANN 包. 文件名会随 CPU 架构不同而变化, 常见架构是 `x86_64` 或 `aarch64`:
 
 `ARCH=$(uname -i)`
 
@@ -150,11 +150,25 @@ openEuler / CentOS:
 
 `git submodule update --init --recursive`
 
-`SOC_VERSION=ascend910b1 pip install -v -e .`
+A3 正式实验必须按 A3 SoC 构建:
+
+`SOC_VERSION=ascend910_93 pip install -v -e .`
 
 如果遇到 build isolation 导致依赖环境混乱, 用:
 
-`SOC_VERSION=ascend910b1 pip install --no-build-isolation -v -e .`
+`SOC_VERSION=ascend910_93 pip install --no-build-isolation -v -e .`
+
+如果 CANN 头文件报 `profiling/prof_api.h` 找不到, 先确认 `pkg_inc` 存在, 再把它加入编译 include path:
+
+`export ASCEND_HOME=/usr/local/Ascend/cann-9.0.0`
+
+`export C_INCLUDE_PATH="${ASCEND_HOME}/$(uname -m)-linux/pkg_inc:${C_INCLUDE_PATH:-}"`
+
+`export CPLUS_INCLUDE_PATH="${ASCEND_HOME}/$(uname -m)-linux/pkg_inc:${CPLUS_INCLUDE_PATH:-}"`
+
+如果 CANN 安装在个人目录, 把 `ASCEND_HOME` 改成 `/home/jhyang/Ascend/cann-9.0.0`. 这不高雅, 但比改系统 include 目录更像人类工程.
+
+A2 预验证如果只安装 `SOC_VERSION=ascend910b1`, 只能验证环境, artifacts, `pangu_chain` 和普通路径. `dispatch_gmm_combine_decode` 的 Ascend Computing Language Neural Network (ACLNN) custom op 只在 A3 `ascend910_93` 构建分支打包. 在 A2 上强跑 vLLM fused decode case, 常见结果是 Python op schema 可见, 运行时 `libopapi.so` 找不到 `aclnnDispatchGmmCombineDecode` 符号.
 
 ## 8. 验证环境
 
@@ -166,9 +180,13 @@ openEuler / CentOS:
 
 确认 custom op:
 
-`python3 -c "import torch, torch_npu; from vllm_ascend.utils import enable_custom_op; print(enable_custom_op()); print(hasattr(torch.ops._C_ascend, 'dispatch_gmm_combine_decode'))"`
+`python3 -c "import importlib, torch, torch_npu; from vllm_ascend.utils import enable_custom_op; print(enable_custom_op()); importlib.import_module('vllm_ascend.vllm_ascend_C'); print(hasattr(torch.ops._C_ascend, 'dispatch_gmm_combine_decode'))"`
 
 期望两个输出都是 `True`.
+
+如果后续运行时报 custom op 符号找不到, source vLLM-Ascend 安装产物里的 custom op 环境:
+
+`source $(python3 -c "import pathlib, vllm_ascend; print(next(pathlib.Path(vllm_ascend.__file__).resolve().parent.glob('_cann_ops_custom/**/set_env.bash')))")`
 
 ## 9. 拉取实验仓库
 
@@ -200,11 +218,11 @@ A2 只有 8 rank, 推荐先用 `num_experts=128`, 每 rank 16 experts.
 
 `ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 run_pangu92_three_case_experiment.py run-case --case-name pangu_chain --op-path pangu --determinism-repeat 2 --dump-output --warmup 2 --repeat 5 --output artifacts/pangu92_moe_weights_sync/results/a2_smoke.csv`
 
-跑 `vllm_base`:
+不要把 A2 smoke 当作 `vllm_base` fused decode 验证. 如果当前环境是 `SOC_VERSION=ascend910b1` 构建, 这一步应跳过:
 
 `ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 run_pangu92_three_case_experiment.py run-case --case-name vllm_base --op-path vllm --determinism-repeat 2 --dump-output --warmup 2 --repeat 5 --output artifacts/pangu92_moe_weights_sync/results/a2_smoke.csv`
 
-校验 output:
+只有在该环境确实安装了包含 `DispatchGmmCombineDecode` ACLNN op 的 A3 custom op 包时, 才运行上面这条命令和后续 output 校验:
 
 `python3 run_pangu92_three_case_experiment.py check-outputs --golden-case pangu_chain --case vllm_base --rtol 1e-2 --atol 1e-2`
 
@@ -275,4 +293,4 @@ A3 正式结论通过标准:
 3. `vllm_base` 和 `vllm_modified` 都与 `pangu_chain` output allclose
 4. timing 只统计 dispatch 到 combine 闭区间
 
-任一条件失败, 结果 invalid.invalid 不是坏事, 它至少比错的结论诚实.
+任一条件失败, 结果 invalid.

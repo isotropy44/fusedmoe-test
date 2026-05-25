@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib
 import os
 from dataclasses import dataclass
 from typing import Callable
@@ -40,11 +41,16 @@ def build_case(config) -> Callable[[], object]:
         raise RuntimeError(
             "vLLM-Ascend custom ops are not registered. Build and install vllm-ascend first."
         )
+    _load_vllm_ascend_extension()
     if not hasattr(torch.ops, "_C_ascend") or not hasattr(
         torch.ops._C_ascend, "dispatch_gmm_combine_decode"
     ):
         raise RuntimeError(
-            "torch.ops._C_ascend.dispatch_gmm_combine_decode is unavailable."
+            "torch.ops._C_ascend.dispatch_gmm_combine_decode is unavailable after "
+            "enable_custom_op() and importing vllm_ascend.vllm_ascend_C. "
+            "For A3, rebuild vllm-ascend with SOC_VERSION=ascend910_93 and source "
+            "the generated _cann_ops_custom set_env.bash. A2 ascend910b1 builds do "
+            "not package this fused decode ACLNN op."
         )
 
     device = torch.device(f"npu:{runtime.local_rank}")
@@ -129,6 +135,17 @@ def build_case(config) -> Callable[[], object]:
         )
 
     return operation
+
+
+def _load_vllm_ascend_extension() -> None:
+    try:
+        importlib.import_module("vllm_ascend.vllm_ascend_C")
+    except ImportError as exc:
+        raise RuntimeError(
+            "Failed to import vllm_ascend.vllm_ascend_C. The Python package may be "
+            "installed, but the C++ extension that registers torch.ops._C_ascend "
+            "is not loaded."
+        ) from exc
 
 
 def _init_distributed(torch, dist, expected_world_size: int) -> RuntimeInfo:

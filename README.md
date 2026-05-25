@@ -8,7 +8,7 @@
 2. `vllm_base`: 未修改版 vLLM-Ascend fused MoE 算子
 3. `vllm_modified`: 修改版 vLLM-Ascend fused MoE 算子
 
-正式结论只看 A3.A2 只做预验证, 用来提前发现环境, artifacts, output 校验, 确定性和可视化链路问题.别拿 A2 延迟去推 A3 结论, 硅片不会负责迁就这种乐观.
+正式结论只看 A3. A2 只做预验证, 用来提前发现环境, artifacts, output 校验, 确定性和可视化链路问题. 别拿 A2 延迟去推 A3 结论, 硅片不会负责迁就这种乐观.
 
 ## 1. 文件说明
 
@@ -28,7 +28,8 @@
 
 ## 2. A2 预验证快速命令
 
-A2 用 8 rank 小配置.推荐 `num_experts=128`, 每 rank 16 experts.
+A2 用 8 rank 小配置. 推荐 `num_experts=128`, 每 rank 16 experts.
+A2 只验证环境, artifacts, `pangu_chain`, output 和画图链路. 如果 vLLM-Ascend 是 `SOC_VERSION=ascend910b1` 构建, 不要在 A2 上跑 `dispatch_gmm_combine_decode`; 该 fused decode Ascend Computing Language Neural Network (ACLNN) custom op 不会被打进 A2 custom op 包.
 
 1. 生成固定 artifacts:
 
@@ -42,7 +43,7 @@ A2 用 8 rank 小配置.推荐 `num_experts=128`, 每 rank 16 experts.
 
 `ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 run_pangu92_three_case_experiment.py run-case --case-name pangu_chain --op-path pangu --determinism-repeat 2 --dump-output --warmup 2 --repeat 5 --output artifacts/pangu92_moe_weights_sync/results/a2_smoke.csv`
 
-4. 跑当前环境里的 vLLM fused 算子:
+4. 如果当前环境确实安装了 A3 `ascend910_93` custom op 包, 才跑当前环境里的 vLLM fused 算子:
 
 `ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 run_pangu92_three_case_experiment.py run-case --case-name vllm_base --op-path vllm --determinism-repeat 2 --dump-output --warmup 2 --repeat 5 --output artifacts/pangu92_moe_weights_sync/results/a2_smoke.csv`
 
@@ -68,7 +69,8 @@ Linux 桌面打开 PNG:
 
 ## 3. A3 正式实验快速命令
 
-A3 8 卡按 16 die 作为 16 rank 使用.正式配置推荐 `num_experts=256`, 每 rank 16 experts.
+A3 8 卡按 16 die 作为 16 rank 使用. 正式配置推荐 `num_experts=256`, 每 rank 16 experts.
+A3 vLLM-Ascend 必须用 `SOC_VERSION=ascend910_93` 构建. 验证 custom op 时需要执行 `enable_custom_op()`, 并显式 import `vllm_ascend.vllm_ascend_C`; 只 import `vllm_ascend` 不足以证明 `torch.ops._C_ascend.dispatch_gmm_combine_decode` 已注册. 这不是玄学, 只是懒加载.
 
 1. 生成正式 artifacts:
 
@@ -122,4 +124,4 @@ A3 8 卡按 16 die 作为 16 rank 使用.正式配置推荐 `num_experts=256`, �
 
 ## 5. 继续阅读
 
-第一次接触 NPU (Neural Processing Unit) 的用户先读 `RUNNING.md`.里面从 root 登录, 创建个人用户, 安装 CANN (Compute Architecture for Neural Networks), 创建 conda 环境, 安装 vLLM-Ascend, 到跑 A2 smoke 都写了.很啰嗦, 但新手文档不啰嗦通常只是把痛苦推迟.
+第一次接触 NPU (Neural Processing Unit) 的用户先读 `RUNNING.md`. 里面从 root 登录, 创建个人用户, 安装 CANN (Compute Architecture for Neural Networks), 创建 conda 环境, 安装 vLLM-Ascend, 到跑 A2 smoke 都写了. 很啰嗦, 但新手文档不啰嗦通常只是把痛苦推迟.
