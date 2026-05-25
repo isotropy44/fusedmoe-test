@@ -1,0 +1,6 @@
+.DS_Store
+artifacts/
+results/
+plots/
+__pycache__/
+*.pyc

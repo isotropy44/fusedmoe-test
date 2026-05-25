@@ -1,39 +1,125 @@
-# MoE Dispatch-Combine Benchmark 入口
+# Pangu 92B MoE 三 Case 对比实验
 
-## 1. 目录内容
+这个仓库用于验证和对比 Pangu 92B decode 场景下 MoE (Mixture of Experts) 从 dispatch 到 combine 的闭区间耗时.
 
-本目录用于存放 A/B/C 三组 MoE (Mixture of Experts) dispatch-to-combine 对比实验的设计, 脚本和运行说明.
+要对比的 3 个 case:
+
+1. `pangu_chain`: `npu_moe_distribute_dispatch_v2 -> npu_grouped_matmul -> npu_dequant_swiglu_quant -> npu_grouped_matmul -> npu_moe_distribute_combine_v2`
+2. `vllm_base`: 未修改版 vLLM-Ascend fused MoE 算子
+3. `vllm_modified`: 修改版 vLLM-Ascend fused MoE 算子
+
+正式结论只看 A3.A2 只做预验证, 用来提前发现环境, artifacts, output 校验, 确定性和可视化链路问题.别拿 A2 延迟去推 A3 结论, 硅片不会负责迁就这种乐观.
+
+## 1. 文件说明
 
 | 文件 | 作用 |
 | --- | --- |
-| `experiment_design.md` | 固定变量, 实验组定义, 计时窗口, 输出约束 |
-| `benchmark_moe_dispatch_combine.py` | Python benchmark 脚本 |
-| `vllm_ascend_fused_moe_adapter.py` | 直接调用 vLLM-Ascend fused MoE 算子的 adapter |
-| `run_vllm_ascend_fused_moe_a3.py` | A3 上一键运行 vLLM-Ascend fused MoE 的 Python runner |
-| `run_pangu92_decode_dispatch_combine_benchmark.py` | Pangu V2 92B decode dispatch-combine microbenchmark |
-| `RUNNING.md` | Ascend A2/A3 与 CUDA 环境搭建, 以及运行命令 |
-| `SOURCES.md` | 公开来源, 本地代码证据, 未确认假设 |
+| `run_pangu92_three_case_experiment.py` | 三 case artifacts, run, output check, plot 主入口 |
+| `run_pangu92_decode_dispatch_combine_benchmark.py` | 单脚本 Pangu / vLLM 双路径 benchmark, 供底层逻辑复用 |
+| `RUNNING.md` | 从零搭建 A2 / A3 环境并运行实验 |
+| `SOURCES.md` | 公开来源和本地代码证据 |
+| `experiment_design.md` | 早期实验设计记录 |
 
-## 2. 快速检查
+实验产物固定在:
 
-不依赖硬件的配置检查:
+`artifacts/pangu92_moe_weights_sync`
 
-`python3 benchmark_moe_dispatch_combine.py --case A --mode plan`
+这个目录不会进入 git.每次执行 `prepare` 都会覆盖旧 artifacts.
 
-在 A3 上真实调用 vLLM-Ascend fused MoE:
+## 2. A2 预验证快速命令
 
-`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 run_vllm_ascend_fused_moe_a3.py --m 24 --world-size 8 --output results/b_vllm_ascend_fused.csv`
+A2 用 8 rank 小配置.推荐 `num_experts=128`, 每 rank 16 experts.
 
-在 A3 上对比 Pangu V2 92B decode dispatch-combine 链路和 vLLM-Ascend fused MoE:
+1. 生成固定 artifacts:
 
-`ASCEND_RT_VISIBLE_DEVICES=0,1,...,15 python3 run_pangu92_decode_dispatch_combine_benchmark.py --batch-size 24 --world-size 16 --op-path both --synthetic-fallback --output results/pangu92_decode_compare_synth.csv`
+`python3 run_pangu92_three_case_experiment.py prepare --batch-size 24 --world-size 8 --num-experts 128 --top-k 8 --quant-mode 2 --synthetic-fallback`
 
-接入真实 dispatch-to-combine callable 后运行 A/B/C:
+2. 校验 artifacts:
 
-`python3 benchmark_moe_dispatch_combine.py --case A --mode callable --backend npu --entrypoint my_moe_adapter:build_case`
+`python3 run_pangu92_three_case_experiment.py verify-artifacts`
 
-`python3 benchmark_moe_dispatch_combine.py --case B --mode callable --backend npu --entrypoint my_moe_adapter:build_case`
+3. 跑 `pangu_chain`:
 
-`python3 benchmark_moe_dispatch_combine.py --case C --mode callable --backend cuda --entrypoint my_megamoe_adapter:build_case`
+`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 run_pangu92_three_case_experiment.py run-case --case-name pangu_chain --op-path pangu --determinism-repeat 2 --dump-output --warmup 2 --repeat 5 --output artifacts/pangu92_moe_weights_sync/results/a2_smoke.csv`
 
-拿任何数字当结论前, 先读 `RUNNING.md`. 脚本很擅长输出小数, 但它不负责保证人类真的量到了该量的东西. 真体贴, 也真冷漠.
+4. 跑当前环境里的 vLLM fused 算子:
+
+`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 run_pangu92_three_case_experiment.py run-case --case-name vllm_base --op-path vllm --determinism-repeat 2 --dump-output --warmup 2 --repeat 5 --output artifacts/pangu92_moe_weights_sync/results/a2_smoke.csv`
+
+5. 对比 output:
+
+`python3 run_pangu92_three_case_experiment.py check-outputs --golden-case pangu_chain --case vllm_base --rtol 1e-2 --atol 1e-2`
+
+6. 生成图:
+
+`python3 run_pangu92_three_case_experiment.py plot --input artifacts/pangu92_moe_weights_sync/results/a2_smoke.csv`
+
+Linux 桌面打开 PNG:
+
+`xdg-open artifacts/pangu92_moe_weights_sync/plots/latency_summary.png`
+
+纯 SSH 服务器查看 PNG:
+
+`python3 -m http.server 8080 -d artifacts/pangu92_moe_weights_sync/plots`
+
+然后在本地浏览器打开:
+
+`http://服务器IP:8080/latency_summary.png`
+
+## 3. A3 正式实验快速命令
+
+A3 8 卡按 16 die 作为 16 rank 使用.正式配置推荐 `num_experts=256`, 每 rank 16 experts.
+
+1. 生成正式 artifacts:
+
+`python3 run_pangu92_three_case_experiment.py prepare --batch-size 24 --world-size 16 --num-experts 256 --top-k 8 --quant-mode 2 --synthetic-fallback`
+
+2. 校验 artifacts:
+
+`python3 run_pangu92_three_case_experiment.py verify-artifacts`
+
+3. 跑 `pangu_chain`:
+
+`ASCEND_RT_VISIBLE_DEVICES=0,1,...,15 python3 run_pangu92_three_case_experiment.py run-case --case-name pangu_chain --op-path pangu --determinism-repeat 3 --dump-output --warmup 20 --repeat 100 --output artifacts/pangu92_moe_weights_sync/results/timing.csv`
+
+4. 在未修改 vLLM-Ascend 环境跑 `vllm_base`:
+
+`ASCEND_RT_VISIBLE_DEVICES=0,1,...,15 python3 run_pangu92_three_case_experiment.py run-case --case-name vllm_base --op-path vllm --determinism-repeat 3 --dump-output --warmup 20 --repeat 100 --output artifacts/pangu92_moe_weights_sync/results/timing.csv`
+
+5. 在修改版 vLLM-Ascend 环境跑 `vllm_modified`:
+
+`ASCEND_RT_VISIBLE_DEVICES=0,1,...,15 python3 run_pangu92_three_case_experiment.py run-case --case-name vllm_modified --op-path vllm --determinism-repeat 3 --dump-output --warmup 20 --repeat 100 --output artifacts/pangu92_moe_weights_sync/results/timing.csv`
+
+6. output 校验:
+
+`python3 run_pangu92_three_case_experiment.py check-outputs --golden-case pangu_chain --case vllm_base --case vllm_modified --rtol 1e-2 --atol 1e-2`
+
+7. 生成图:
+
+`python3 run_pangu92_three_case_experiment.py plot --input artifacts/pangu92_moe_weights_sync/results/timing.csv`
+
+## 4. 结果怎么看
+
+关键输出:
+
+`artifacts/pangu92_moe_weights_sync/results/timing.csv`
+
+`artifacts/pangu92_moe_weights_sync/results/output_check.csv`
+
+`artifacts/pangu92_moe_weights_sync/results/summary.csv`
+
+`artifacts/pangu92_moe_weights_sync/plots/latency_boxplot.png`
+
+`artifacts/pangu92_moe_weights_sync/plots/latency_summary.png`
+
+只有这些条件都满足, 才能看 timing:
+
+1. `verify-artifacts` 通过
+2. 每个 case 的 `determinism_passed=True`
+3. `vllm_base` 和 `vllm_modified` 相对 `pangu_chain` 的 `output_allclose=True`
+
+否则图和 CSV 只能当失败诊断材料, 不是性能结论.
+
+## 5. 继续阅读
+
+第一次接触 NPU (Neural Processing Unit) 的用户先读 `RUNNING.md`.里面从 root 登录, 创建个人用户, 安装 CANN (Compute Architecture for Neural Networks), 创建 conda 环境, 安装 vLLM-Ascend, 到跑 A2 smoke 都写了.很啰嗦, 但新手文档不啰嗦通常只是把痛苦推迟.

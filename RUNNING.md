@@ -1,253 +1,278 @@
-# A/B/C Benchmark 运行说明
+# A2 / A3 NPU 运行说明
 
-## 1. 脚本作用
+本文面向第一次接触 NPU (Neural Processing Unit) 的用户.目标不是优雅, 是让你能把实验跑起来, 并且知道每一步失败时该看哪里.
 
-主脚本为:
+## 1. 基本概念
 
-`python3 fusedmoe-test/benchmark_moe_dispatch_combine.py`
+NPU 是昇腾 AI 处理器.A2 和 A3 是不同机器平台.A2 这次只做预验证, A3 做正式性能结论.
 
-它提供 3 种模式:
+rank 是分布式进程编号.8 rank 表示启动 8 个进程.A3 8 卡通常可以按 16 die 暴露为 16 rank.MoE (Mixture of Experts) 的 expert 会按 rank 切分, 所以 `num_experts / world_size` 是每 rank 本地 expert 数.
 
-| 模式 | 用途 |
-| --- | --- |
-| `plan` | 打印精确配置和环境变量, 不执行设备侧工作 |
-| `callable` | 导入 Python callable, 使用 NPU 或 CUDA event 计时, 是 A 和 B 的主模式 |
-| `deepgemm` | 启动 DeepGEMM `tests/test_mega_moe.py` 跑 case C, 这是粗粒度集成检查, 不是首选内层 event 计时 |
+EP (Expert Parallel) 是 expert 并行域.实验要求 3 个 case 的 `world_size`, rank 映射, `ASCEND_RT_VISIBLE_DEVICES`, `num_experts`, `top_k`, `quant_mode` 一致.不同进程里的 `group_ep` 字符串不要求相同, 只要求当前环境可创建并可用.
 
-严格路径是 `callable`: 入口函数返回一个零参数 callable, callable 内部只包含 dispatch-to-combine. 脚本负责 warmup, repeat, device event, CSV 写入和固定 metadata. 
+## 2. 推荐版本
 
-## 2. Ascend A2/A3 环境
+vLLM-Ascend `releases/v0.18.0` 按官方安装文档使用:
 
-推荐基础栈如下:
-
-| 组件 | 推荐版本 |
+| 组件 | 版本 |
 | --- | --- |
 | CANN (Compute Architecture for Neural Networks) | 9.0.0 |
-| PyTorch | 2.8.0 |
-| torch-npu | 2.8.0.post2 |
-| Python | 3.10 或 3.11 |
+| NNAL | 9.0.0 |
+| Python | >= 3.10, < 3.12 |
+| PyTorch | 2.9.0 |
+| torch-npu | 2.9.0.post2 |
+| vLLM | v0.18.0 |
+| vLLM-Ascend | releases/v0.18.0 |
 
-最小搭建步骤:
+先按这些版本跑通.不要一上来就混版本, 那不是自由, 是噪声.
 
-1. 安装目标 OS 和 CPU 架构对应的 Ascend driver, firmware, CANN 9.0.0 packages. 
-2. 加载 CANN 环境:
+## 3. root 登录后检查机器
 
-`source /usr/local/Ascend/ascend-toolkit/set_env.sh`
+root 登录:
 
-3. 创建 Python 环境:
+`whoami`
 
-`conda create -n moe-a3 python=3.10 -y`
+确认 NPU 可见:
 
-`conda activate moe-a3`
+`npu-smi info`
 
-4. 安装与 CANN 9.0.0 和 CPU 架构匹配的 PyTorch 与 torch-npu wheel:
+如果这里看不到卡, 不要继续装 Python 包.先处理 driver, firmware, device 权限.
 
-vLLM-Ascend `releases/v0.13.0` 的 `requirements.txt` 明确固定:
+## 4. 创建个人用户
 
-`torch==2.8.0`
+以下假设用户名是 `jhyang`:
 
-`torch-npu==2.8.0.post2`
+`useradd -m -s /bin/bash jhyang`
 
-所以这里不要再手工装 2.10.x. 直接按 vLLM-Ascend 依赖安装, 或安装同版本 wheel:
+`passwd jhyang`
 
-`pip install torch==2.8.0 torch-npu==2.8.0.post2`
+如果需要 sudo 权限, openEuler / CentOS 常见命令:
 
-5. 安装 A/B callable 使用的项目 runtime, 通常是匹配分支的 vLLM-Ascend 或 omni-npu: [vllm-ascend/releases/v0.13.0](https://github.com/vllm-project/vllm-ascend/tree/releases/v0.13.0)
+`usermod -aG wheel jhyang`
 
-`pip install -r vllm-ascend/requirements.txt`
+Ubuntu 常见命令:
 
-`pip install -e vllm-ascend`
+`usermod -aG sudo jhyang`
 
-6. 验证 NPU:
+创建工作目录:
 
-`python3 -c "import torch, torch_npu; print(torch.npu.is_available()); print(torch.__version__); print(torch_npu.__version__)"`
+`mkdir -p /home/jhyang/workcode`
 
-在 A3 上跑 case B 时设置:
+`chown -R jhyang:jhyang /home/jhyang`
 
-`export VLLM_ASCEND_ENABLE_FUSED_MC2=2`
+切到个人用户:
 
-跑 case A 时设置:
+`su - jhyang`
 
-`export VLLM_ASCEND_ENABLE_FUSED_MC2=0`
+后续除系统依赖安装外, 都在个人用户下执行.
 
-脚本会按 case 自动设置这些变量, 但显式 export 能让日志更容易读. 人类还是需要一点点可读性, 很麻烦, 但没办法. 
+## 5. 个人目录安装 CANN 9.0.0 和 NNAL 9.0.0
 
-## 3. CUDA MegaMoE 环境
+创建下载目录:
 
-DeepGEMM MegaMoE 推荐基础栈:
+`mkdir -p /home/jhyang/Ascend/downloads`
 
-| 组件 | 推荐版本 |
-| --- | --- |
-| GPU | NVIDIA SM100, 用于 MegaMoE 目标路径 |
-| CUDA Toolkit | SM100 使用 12.9 或更新版本 |
-| PyTorch | 2.9.0 或更新版本 |
-| Python | 3.10 或 3.11 |
-| [MegaMoE](https://github.com/deepseek-ai/DeepGEMM/tree/mega-update) | `mega-update` 分支, 或当前包含 MegaMoE 的分支 |
+`cd /home/jhyang/Ascend/downloads`
 
-DeepGEMM 说明 SM100 需要 CUDA 12.9 或更高版本, PyTorch 通用要求为 2.1 或更高版本, MegaMoE symmetric memory 备注要求 PyTorch >= 2.9. C 路径建议使用 PyTorch 2.9.0+ 和官方 CUDA 12.8 wheel, 同时保留 CUDA Toolkit 12.9+ 用于编译. 这组合不优雅, 但现实从来不负责审美.
+下载 CANN 包.文件名会随 CPU 架构不同而变化, 常见架构是 `x86_64` 或 `aarch64`:
 
-最小搭建步骤:
+`ARCH=$(uname -i)`
 
-`conda create -n moe-cuda python=3.11 -y`
+`wget --header="Referer: https://www.hiascend.com/" "https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%209.0.0/Ascend-cann-toolkit_9.0.0_linux-${ARCH}.run"`
 
-`conda activate moe-cuda`
+`wget --header="Referer: https://www.hiascend.com/" "https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%209.0.0/Ascend-cann-910b-ops_9.0.0_linux-${ARCH}.run"`
 
-`pip install torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu128`
+`wget --header="Referer: https://www.hiascend.com/" "https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%209.0.0/Ascend-cann-nnal_9.0.0_linux-${ARCH}.run"`
 
-`cd repos/DeepGEMM`
+安装:
+
+`chmod +x Ascend-cann-*.run`
+
+`./Ascend-cann-toolkit_9.0.0_linux-${ARCH}.run --full --install-path=/home/jhyang/Ascend/cann-9.0.0`
+
+`source /home/jhyang/Ascend/cann-9.0.0/ascend-toolkit/set_env.sh`
+
+`./Ascend-cann-910b-ops_9.0.0_linux-${ARCH}.run --install --install-path=/home/jhyang/Ascend/cann-9.0.0`
+
+`./Ascend-cann-nnal_9.0.0_linux-${ARCH}.run --install --install-path=/home/jhyang/Ascend/cann-9.0.0`
+
+`source /home/jhyang/Ascend/cann-9.0.0/nnal/atb/set_env.sh`
+
+写入 `~/.bashrc`:
+
+`echo 'source /home/jhyang/Ascend/cann-9.0.0/ascend-toolkit/set_env.sh' >> ~/.bashrc`
+
+`echo 'source /home/jhyang/Ascend/cann-9.0.0/nnal/atb/set_env.sh' >> ~/.bashrc`
+
+如果安装器不接受 `--install-path`, 就让 root 安装到默认路径 `/usr/local/Ascend`, 然后把对应 `set_env.sh` 写入个人用户 `~/.bashrc`.
+
+## 6. 创建 conda 环境
+
+`conda create -n vllm-a2-018 python=3.11 -y`
+
+`conda activate vllm-a2-018`
+
+`pip install -U pip setuptools wheel`
+
+安装画图依赖:
+
+`pip install matplotlib`
+
+如果系统缺编译工具, root 安装.
+
+Ubuntu:
+
+`apt-get update -y && apt-get install -y gcc g++ cmake libnuma-dev wget git curl jq`
+
+openEuler / CentOS:
+
+`yum install -y gcc gcc-c++ cmake numactl-devel wget git curl jq`
+
+## 7. 安装未修改版 vLLM-Ascend
+
+拉代码:
+
+`cd /home/jhyang/workcode`
+
+`git clone --branch v0.18.0 https://github.com/vllm-project/vllm.git`
+
+`git clone --branch releases/v0.18.0 https://github.com/vllm-project/vllm-ascend.git`
+
+安装 vLLM:
+
+`cd /home/jhyang/workcode/vllm`
+
+`VLLM_TARGET_DEVICE=empty pip install -v -e .`
+
+安装 vLLM-Ascend:
+
+`cd /home/jhyang/workcode/vllm-ascend`
 
 `git submodule update --init --recursive`
 
-`./develop.sh`
+`SOC_VERSION=ascend910b1 pip install -v -e .`
 
-`pip install -e. `
+如果遇到 build isolation 导致依赖环境混乱, 用:
 
-验证 CUDA:
+`SOC_VERSION=ascend910b1 pip install --no-build-isolation -v -e .`
 
-`python -c "import torch; print(torch.cuda.is_available()); print(torch.version.cuda)"`
+## 8. 验证环境
 
-验证 DeepGEMM import:
+确认版本:
 
-`python -c "import deep_gemm; print(deep_gemm.__file__)"`
+`python3 -c "import torch, torch_npu; print(torch.__version__); print(torch_npu.__version__); print(torch.npu.is_available())"`
 
-## 4. 配置检查
+期望看到 PyTorch `2.9.0`, torch-npu `2.9.0.post2`, NPU 可用.
 
-`plan` 模式可在 macOS 或任意 host 上运行:
-
-`python fusedmoe-test/benchmark_moe_dispatch_combine.py --case A --mode plan`
-
-`python fusedmoe-test/benchmark_moe_dispatch_combine.py --case B --mode plan --m 24 --world-size 8`
-
-`python fusedmoe-test/benchmark_moe_dispatch_combine.py --case C --mode plan --backend cuda`
-
-## 5. 在 Ascend A3 上真实运行 vLLM-Ascend fused MoE
-
-本目录已经提供直接调用 vLLM-Ascend fused MoE 算子的脚本:
-
-`run_vllm_ascend_fused_moe_a3.py`
-
-它会调用:
-
-`torch.ops._C_ascend.dispatch_gmm_combine_decode`
-
-也就是 vLLM-Ascend `VLLM_ASCEND_ENABLE_FUSED_MC2=2` 路径中的 fused MoE decode 算子. 该算子内部覆盖 dispatch, GMM1, dequant, SwiGLU, dynamic quant, GMM2, dequant, combine. benchmark 计时只包住这个 op 调用, 初始化, 造输入, 造权重不进入计时窗口.
-
-先确认 vLLM-Ascend 已经安装并能注册自定义算子:
+确认 custom op:
 
 `python3 -c "import torch, torch_npu; from vllm_ascend.utils import enable_custom_op; print(enable_custom_op()); print(hasattr(torch.ops._C_ascend, 'dispatch_gmm_combine_decode'))"`
 
-一键运行 8 卡 A3:
+期望两个输出都是 `True`.
 
-`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 fusedmoe-test/run_vllm_ascend_fused_moe_a3.py --m 24 --world-size 8 --warmup 20 --repeat 100 --output results/b_vllm_ascend_fused.csv`
+## 9. 拉取实验仓库
 
-单卡 smoke test 可以直接跑, 不会再绕 torchrun:
+`cd /home/jhyang/workcode`
 
-`ASCEND_RT_VISIBLE_DEVICES=0 python3 fusedmoe-test/run_vllm_ascend_fused_moe_a3.py --m 24 --world-size 1 --num-experts 16 --warmup 2 --repeat 5 --output /tmp/b_smoke.csv`
+SSH:
 
-注意: 单卡 smoke test 不适合沿用 DeepSeek V4 的 `--num-experts 384`, 因为 fused op 的本地 expert 数有 tiling 限制. 单卡只用于验证 op 能被调用, 正式对比仍用 8 卡默认配置.
+`git clone git@github.com:isotropy44/fusedmoe-test.git`
 
-如果你已经在 torchrun 环境里, 也可以显式运行:
+HTTPS:
 
-`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc-per-node=8 fusedmoe-test/run_vllm_ascend_fused_moe_a3.py --no-torchrun --m 24 --world-size 8 --warmup 20 --repeat 100 --output results/b_vllm_ascend_fused.csv`
+`git clone https://github.com/isotropy44/fusedmoe-test.git`
 
-可改参数:
+`cd /home/jhyang/workcode/fusedmoe-test`
 
-| 参数或环境变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `--m` | `24` | 本 rank 输入 token 数 |
-| `--world-size` | `8` | NPU 数, 必须等于 torchrun 进程数 |
-| `--hidden-size` | `7168` | DeepSeek V4 参考 hidden size |
-| `--moe-intermediate-size` | `3072` | DeepSeek V4 参考 MoE intermediate size |
-| `--num-experts` | `384` | DeepSeek V4 参考 expert 数 |
-| `--num-experts-per-tok` | `6` | top-k |
-| `FMOE_ASCEND_DTYPE` | `bf16` | 可设为 `bf16` 或 `fp16` |
-| `FMOE_ASCEND_QUANT_MODE` | `0` | 传给 fused op 的 quant_mode |
-| `FMOE_ASCEND_WEIGHT_LAYOUT` | `single` | 可设为 `single` 或 `list`; `single` 对应 vLLM 常规非 dynamic EPLB 权重布局 |
+## 10. A2 预验证
 
-脚本在多 rank 下会对每轮 device event 耗时做 `all_reduce(max)`, rank 0 写 CSV. 这是集体通信算子的合理统计方式, 不然拿 rank 0 的单点时间冒充全局时间, 只是更精致的自欺.
+A2 只有 8 rank, 推荐先用 `num_experts=128`, 每 rank 16 experts.
 
-## 6. 在 Ascend 上运行自定义 A 和 B
+生成 artifacts:
 
-创建一个 adapter module, 例如 `my_moe_adapter.py`, 其中提供:
+`python3 run_pangu92_three_case_experiment.py prepare --batch-size 24 --world-size 8 --num-experts 128 --top-k 8 --quant-mode 2 --synthetic-fallback`
 
-`def build_case(config):`
+校验 artifacts:
 
-它必须返回一个零参数 callable. 该 callable 只能执行:
+`python3 run_pangu92_three_case_experiment.py verify-artifacts`
 
-`dispatch -> GMM1 -> dequant -> SwiGLU -> dynamic quant -> GMM2 -> dequant -> combine`
+跑 `pangu_chain`:
 
-运行 case A:
+`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 run_pangu92_three_case_experiment.py run-case --case-name pangu_chain --op-path pangu --determinism-repeat 2 --dump-output --warmup 2 --repeat 5 --output artifacts/pangu92_moe_weights_sync/results/a2_smoke.csv`
 
-`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 fusedmoe-test/benchmark_moe_dispatch_combine.py --case A --mode callable --backend npu --entrypoint my_moe_adapter:build_case --m 24 --world-size 8 --warmup 20 --repeat 100 --output results/a.csv`
+跑 `vllm_base`:
 
-运行 case B:
+`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 run_pangu92_three_case_experiment.py run-case --case-name vllm_base --op-path vllm --determinism-repeat 2 --dump-output --warmup 2 --repeat 5 --output artifacts/pangu92_moe_weights_sync/results/a2_smoke.csv`
 
-`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 fusedmoe-test/benchmark_moe_dispatch_combine.py --case B --mode callable --backend npu --entrypoint my_moe_adapter:build_case --m 24 --world-size 8 --warmup 20 --repeat 100 --output results/b.csv`
+校验 output:
 
-B 跑完后, 必须检查日志是否显示命中 fused path. 对 vLLM-Ascend, 这意味着 `VLLM_ASCEND_ENABLE_FUSED_MC2=2`, 且实际调用链到达 `torch.ops._C_ascend.dispatch_gmm_combine_decode`. 
+`python3 run_pangu92_three_case_experiment.py check-outputs --golden-case pangu_chain --case vllm_base --rtol 1e-2 --atol 1e-2`
 
-## 7. 在 Ascend A3 上对比 Pangu V2 92B decode 双路径
+生成 PNG:
 
-本目录提供 Pangu V2 92B decode 场景的双路径 microbenchmark:
+`python3 run_pangu92_three_case_experiment.py plot --input artifacts/pangu92_moe_weights_sync/results/a2_smoke.csv`
 
-`run_pangu92_decode_dispatch_combine_benchmark.py`
+Linux 桌面打开:
 
-默认 `--op-path both`, 会在同一脚本内比较两条路径:
+`xdg-open artifacts/pangu92_moe_weights_sync/plots/latency_summary.png`
 
-`npu_moe_distribute_dispatch_v2 -> npu_grouped_matmul -> npu_dequant_swiglu_quant -> npu_grouped_matmul -> npu_moe_distribute_combine_v2`
+纯 SSH 查看:
 
-`torch.ops._C_ascend.dispatch_gmm_combine_decode`
+`python3 -m http.server 8080 -d artifacts/pangu92_moe_weights_sync/plots`
 
-不统计 gate, `npu_moe_gating_top_k`, shared expert, final add. `--batch-size` 表示每 rank 当前 MoE 层的 decode token 数, 输入 `hidden_states` shape 为 `[batch_size, hidden_size]`.
+然后浏览器打开:
 
-两条路径复用同一份输入, 同一份权重, 同一份 scale, 同一个 `quant_mode=2`. 默认会在 warmup 和 repeat 前做一次数值一致性检查, 输出转 float32 后计算 `max_abs_diff`, `mean_abs_diff`, `max_rel_diff`, 并用 `rtol=1e-2`, `atol=1e-2` 做 `allclose`. 数值检查不进入计时窗口. 如果数值不一致, 脚本直接失败, 不输出一份看似漂亮但没有意义的时间表.
+`http://A2服务器IP:8080/latency_summary.png`
 
-单 rank smoke test:
+## 11. A3 正式三 case 实验
 
-`ASCEND_RT_VISIBLE_DEVICES=0 python3 fusedmoe-test/run_pangu92_decode_dispatch_combine_benchmark.py --batch-size 24 --world-size 1 --num-experts 16 --op-path both --synthetic-fallback --warmup 2 --repeat 5 --output /tmp/pangu92_compare_smoke.csv`
+A3 8 卡按 16 die 作为 16 rank 使用.
 
-A3 8 卡共有 16 die 时, 按 16 个 rank 跑完整 Pangu 92B 256 experts, 每 rank 16 experts:
+生成正式 artifacts:
 
-`ASCEND_RT_VISIBLE_DEVICES=0,1,...,15 python3 fusedmoe-test/run_pangu92_decode_dispatch_combine_benchmark.py --batch-size 24 --world-size 16 --op-path both --synthetic-fallback --warmup 20 --repeat 100 --output results/pangu92_decode_compare_synth.csv`
+`python3 run_pangu92_three_case_experiment.py prepare --batch-size 24 --world-size 16 --num-experts 256 --top-k 8 --quant-mode 2 --synthetic-fallback`
 
-16 rank 真实 92B 权重, 允许失败后回退 synthetic:
+校验:
 
-`ASCEND_RT_VISIBLE_DEVICES=0,1,...,15 python3 fusedmoe-test/run_pangu92_decode_dispatch_combine_benchmark.py --batch-size 24 --world-size 16 --op-path both --model-path /path/to/pangu92 --synthetic-fallback --warmup 20 --repeat 100 --output results/pangu92_decode_compare_real.csv`
+`python3 run_pangu92_three_case_experiment.py verify-artifacts`
 
-若要强制使用真实权重, 去掉 `--synthetic-fallback`. 如果权重 key 或 shape 无法匹配脚本预期, 脚本会直接报错. 这比悄悄换成随机权重诚实一点, 虽然诚实经常不讨人喜欢.
+跑 `pangu_chain`:
 
-只跑单一路径时使用:
+`ASCEND_RT_VISIBLE_DEVICES=0,1,...,15 python3 run_pangu92_three_case_experiment.py run-case --case-name pangu_chain --op-path pangu --determinism-repeat 3 --dump-output --warmup 20 --repeat 100 --output artifacts/pangu92_moe_weights_sync/results/timing.csv`
 
-`--op-path pangu`
+在未修改 vLLM-Ascend 环境跑 `vllm_base`:
 
-或:
+`ASCEND_RT_VISIBLE_DEVICES=0,1,...,15 python3 run_pangu92_three_case_experiment.py run-case --case-name vllm_base --op-path vllm --determinism-repeat 3 --dump-output --warmup 20 --repeat 100 --output artifacts/pangu92_moe_weights_sync/results/timing.csv`
 
-`--op-path vllm`
+在修改版 vLLM-Ascend 环境跑 `vllm_modified`:
 
-单路径模式默认不做数值检查. 如果要跳过双路径数值检查, 显式传 `--no-check-numerics`. 这只适合调试算子能否启动, 不适合拿来做正式对比.
+`ASCEND_RT_VISIBLE_DEVICES=0,1,...,15 python3 run_pangu92_three_case_experiment.py run-case --case-name vllm_modified --op-path vllm --determinism-repeat 3 --dump-output --warmup 20 --repeat 100 --output artifacts/pangu92_moe_weights_sync/results/timing.csv`
 
-## 8. 在 CUDA 上运行 C
+跨 case output 校验:
 
-首选 callable 模式:
+`python3 run_pangu92_three_case_experiment.py check-outputs --golden-case pangu_chain --case vllm_base --case vllm_modified --rtol 1e-2 --atol 1e-2`
 
-`CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 fusedmoe-test/benchmark_moe_dispatch_combine.py --case C --mode callable --backend cuda --entrypoint my_megamoe_adapter:build_case --m 24 --world-size 8 --warmup 20 --repeat 100 --output results/c.csv`
+生成图:
 
-粗粒度 DeepGEMM 集成模式:
+`python3 run_pangu92_three_case_experiment.py plot --input artifacts/pangu92_moe_weights_sync/results/timing.csv`
 
-`CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python fusedmoe-test/benchmark_moe_dispatch_combine.py --case C --mode deepgemm --backend cuda --m 24 --world-size 8 --output results/c_deepgemm.csv`
+## 12. 通过标准
 
-最终对比使用 callable 模式. `deepgemm` 模式只用于证明 CUDA 栈和 DeepGEMM MegaMoE 路径可以启动. 
+A2 预验证通过标准:
 
-## 9. 对比结果
+1. `npu-smi info` 可见 8 张 A2
+2. `torch.npu.is_available()` 为 `True`
+3. `dispatch_gmm_combine_decode` custom op 可见
+4. `verify-artifacts` 通过
+5. `pangu_chain` 和 `vllm_base` 的 `determinism_passed=True`
+6. `check-outputs` 通过
+7. `plot` 能生成 PNG
 
-所有 case 必须使用相同的 `--m`, `--world-size`, 模型字段, warmup, repeat, 权重来源. 
+A3 正式结论通过标准:
 
-主表:
+1. 3 个 case 都使用同一份 `artifacts/pangu92_moe_weights_sync`
+2. 3 个 case 都通过确定性验证
+3. `vllm_base` 和 `vllm_modified` 都与 `pangu_chain` output allclose
+4. timing 只统计 dispatch 到 combine 闭区间
 
-| Case | Median ms | Mean ms | 说明 |
-| --- | ---: | ---: | --- |
-| A | TBD (To Be Determined) | TBD | Ascend 普通 MoE |
-| B | TBD | TBD | Ascend fused MoE |
-| C | TBD | TBD | CUDA MegaMoE |
-
-只比较相同机器类型和相同不变量集合下的 `sample_ms`. A2/A3 和 CUDA 属于不同硬件家族, 所以 A/B 是同平台 kernel 对比, C 是跨平台参考. 把 C 当架构参考, 不要当道德审判. 硅片没有兴趣照顾人的自尊心. 
+任一条件失败, 结果 invalid.invalid 不是坏事, 它至少比错的结论诚实.
