@@ -40,6 +40,8 @@ TENSOR_NAMES = [
     "quant_scale",
 ]
 CASE_NAMES = ["pangu_chain", "vllm_base", "vllm_modified"]
+DETERMINISM_RTOL = 1e-4
+DETERMINISM_ATOL = 1e-4
 
 
 def parse_args() -> argparse.Namespace:
@@ -478,8 +480,8 @@ def make_bench_config(cfg: dict[str, Any], args: argparse.Namespace) -> bench.Be
         seed=int(cfg.get("seed", 0)),
         op_path=args.op_path,
         check_numerics=False,
-        rtol=1e-2,
-        atol=1e-2,
+        rtol=DETERMINISM_RTOL,
+        atol=DETERMINISM_ATOL,
     )
 
 
@@ -505,7 +507,13 @@ def check_determinism(torch, operation, repeat: int) -> dict[str, Any]:
     passed = True
     for _ in range(repeat - 1):
         output = bench.unwrap_output(bench.run_once_synced(torch, operation))
-        metrics = compare_tensors(torch, reference, output, 1e-2, 1e-2)
+        metrics = compare_tensors(
+            torch,
+            reference,
+            output,
+            DETERMINISM_RTOL,
+            DETERMINISM_ATOL,
+        )
         max_abs = max(max_abs, float(metrics["max_abs_diff"]))
         max_rel = max(max_rel, float(metrics["max_rel_diff"]))
         passed = passed and bool(metrics["allclose"])
@@ -594,6 +602,8 @@ def append_timing_csv(
         "determinism_passed",
         "determinism_max_abs_diff",
         "determinism_max_rel_diff",
+        "determinism_rtol",
+        "determinism_atol",
         "artifact_hash",
         "batch_size",
         "world_size",
@@ -622,6 +632,8 @@ def append_timing_csv(
                 "determinism_passed": determinism["passed"],
                 "determinism_max_abs_diff": determinism["max_abs_diff"],
                 "determinism_max_rel_diff": determinism["max_rel_diff"],
+                "determinism_rtol": DETERMINISM_RTOL,
+                "determinism_atol": DETERMINISM_ATOL,
                 "artifact_hash": metadata["artifact_hash"],
                 "batch_size": cfg.batch_size,
                 "world_size": cfg.world_size,

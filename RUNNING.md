@@ -285,7 +285,7 @@ A2 预验证通过标准:
 1. `npu-smi info` 可见 8 张 A2
 2. `torch.npu.is_available()` 为 `True`
 3. `prepare` 和 `verify-artifacts` 通过
-4. `pangu_chain` 的 `determinism_passed=True`
+4. `pangu_chain` 的 `determinism_passed=True`, 且确定性校验使用 `rtol=1e-4`, `atol=1e-4`
 5. `pangu_chain` 能写出 timing CSV 和 output artifact
 6. `plot` 能生成 PNG
 
@@ -294,7 +294,7 @@ A2 上 `dispatch_gmm_combine_decode` 和 `vllm_base` 属于可选验证. 只有�
 A3 正式结论通过标准:
 
 1. 3 个 case 都使用同一份 `artifacts/pangu92_moe_weights_sync`
-2. 3 个 case 都通过确定性验证
+2. 3 个 case 都通过确定性验证, 确定性 tolerance 为 `rtol=1e-4`, `atol=1e-4`
 3. `vllm_base` 和 `vllm_modified` 都与 `pangu_chain` output allclose
 4. timing 只统计 dispatch 到 combine 闭区间
 

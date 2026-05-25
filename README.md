@@ -15,10 +15,10 @@
 | 文件 | 作用 |
 | --- | --- |
 | `run_pangu92_three_case_experiment.py` | 三 case artifacts, run, output check, plot 主入口 |
-| `run_pangu92_decode_dispatch_combine_benchmark.py` | 单脚本 Pangu / vLLM 双路径 benchmark, 供底层逻辑复用 |
+| `run_pangu92_decode_dispatch_combine_benchmark.py` | 三 case 主脚本复用的底层 Pangu / vLLM op 实现 |
 | `RUNNING.md` | 从零搭建 A2 / A3 环境并运行实验 |
 | `SOURCES.md` | 公开来源和本地代码证据 |
-| `experiment_design.md` | 早期实验设计记录 |
+| `experiment_design.md` | 当前三 case 实验设计和读数说明 |
 
 实验产物固定在:
 
@@ -121,7 +121,7 @@ A3 vLLM-Ascend 必须用 `SOC_VERSION=ascend910_93` 构建. 验证 custom op 时
 正式 A3 对比只有这些条件都满足, 才能看 timing:
 
 1. `verify-artifacts` 通过
-2. 每个 case 的 `determinism_passed=True`
+2. 每个 case 的 `determinism_passed=True`, 且确定性校验使用 `rtol=1e-4`, `atol=1e-4`
 3. `vllm_base` 和 `vllm_modified` 相对 `pangu_chain` 的 `output_allclose=True`
 
 否则图和 CSV 只能当失败诊断材料, 不是性能结论.
