@@ -129,6 +129,36 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     RESULT_DIR.mkdir()
     PLOT_DIR.mkdir()
 
+    cfg["weight_source"] = resolve_weight_source(torch, cfg, args)
+    try:
+        rank_hashes = write_rank_artifacts(torch, cfg, args)
+    except Exception as exc:
+        if cfg["weight_source"] != "real" or not args.synthetic_fallback:
+            raise
+        print(f"warning: failed to build real artifacts, fallback to synthetic: {exc}")
+        shutil.rmtree(INPUT_DIR)
+        INPUT_DIR.mkdir()
+        cfg["weight_source"] = "synthetic"
+        rank_hashes = write_rank_artifacts(torch, cfg, args)
+    metadata = {
+        "schema_version": 1,
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "artifact_dir": str(ARTIFACT_DIR),
+        "config": cfg,
+        "rank_hashes": rank_hashes,
+    }
+    metadata["artifact_hash"] = artifact_hash(metadata)
+    write_json(METADATA_PATH, metadata)
+    print(f"prepared artifacts: {ARTIFACT_DIR}")
+    print(f"artifact_hash={metadata['artifact_hash']}")
+    return 0
+
+
+def write_rank_artifacts(
+    torch,
+    cfg: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, dict[str, str]]:
     rank_hashes: dict[str, dict[str, str]] = {}
     for rank in range(cfg["world_size"]):
         tensors = build_rank_tensors(torch, cfg, args, rank)
@@ -143,18 +173,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             },
             rank_input_path(rank),
         )
-    metadata = {
-        "schema_version": 1,
-        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "artifact_dir": str(ARTIFACT_DIR),
-        "config": cfg,
-        "rank_hashes": rank_hashes,
-    }
-    metadata["artifact_hash"] = artifact_hash(metadata)
-    write_json(METADATA_PATH, metadata)
-    print(f"prepared artifacts: {ARTIFACT_DIR}")
-    print(f"artifact_hash={metadata['artifact_hash']}")
-    return 0
+    return rank_hashes
 
 
 def config_from_prepare_args(args: argparse.Namespace) -> dict[str, Any]:
@@ -170,7 +189,7 @@ def config_from_prepare_args(args: argparse.Namespace) -> dict[str, Any]:
         "synthetic_fallback": bool(args.synthetic_fallback),
         "layer_index": args.layer_index,
         "seed": args.seed,
-        "weight_source": "real" if args.model_path else "synthetic",
+        "weight_source": "",
     }
 
 
@@ -191,22 +210,27 @@ def validate_artifact_config(cfg: dict[str, Any]) -> None:
         )
 
 
-def build_rank_tensors(torch, cfg: dict[str, Any], args: argparse.Namespace, rank: int) -> dict[str, Any]:
-    if args.model_path:
-        try:
-            weights = build_real_rank_weights(torch, cfg, rank)
-            weight_source = "real"
-        except Exception:
-            if not args.synthetic_fallback:
-                raise
-            weights = build_synthetic_rank_weights(torch, cfg, rank)
-            weight_source = "synthetic"
-    else:
+def resolve_weight_source(torch, cfg: dict[str, Any], args: argparse.Namespace) -> str:
+    if not args.model_path:
+        if args.synthetic_fallback:
+            return "synthetic"
+        raise ValueError("--model-path is required unless --synthetic-fallback is set")
+    try:
+        bench.load_weight_tensors(Path(cfg["model_path"]), int(cfg["layer_index"]))
+        return "real"
+    except Exception:
         if not args.synthetic_fallback:
-            raise ValueError("--model-path is required unless --synthetic-fallback is set")
+            raise
+        return "synthetic"
+
+
+def build_rank_tensors(torch, cfg: dict[str, Any], args: argparse.Namespace, rank: int) -> dict[str, Any]:
+    if cfg["weight_source"] == "real":
+        weights = build_real_rank_weights(torch, cfg, rank)
+    elif cfg["weight_source"] == "synthetic":
         weights = build_synthetic_rank_weights(torch, cfg, rank)
-        weight_source = "synthetic"
-    cfg["weight_source"] = weight_source
+    else:
+        raise ValueError(f"unknown weight_source={cfg['weight_source']}")
 
     generator = torch.Generator(device="cpu")
     generator.manual_seed(int(cfg["seed"]) + rank)
@@ -389,7 +413,13 @@ def cmd_run_case(args: argparse.Namespace) -> int:
             f"max_rel_diff={determinism['max_rel_diff']:.8g}"
         )
     if args.dump_output:
-        save_case_output(torch, args.case_name, runtime.rank, determinism["reference_output"])
+        save_case_output(
+            torch,
+            args.case_name,
+            runtime.rank,
+            determinism["reference_output"],
+            metadata,
+        )
 
     samples_ms = bench.measure(torch, cfg, operation)
     summary = bench.summarize(samples_ms)
@@ -514,13 +544,21 @@ def compare_tensors(torch, expected, actual, rtol: float, atol: float) -> dict[s
     }
 
 
-def save_case_output(torch, case_name: str, rank: int, output) -> None:
+def save_case_output(
+    torch,
+    case_name: str,
+    rank: int,
+    output,
+    metadata: dict[str, Any],
+) -> None:
     case_dir = OUTPUT_DIR / case_name
     case_dir.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "case_name": case_name,
             "rank": rank,
+            "artifact_hash": metadata["artifact_hash"],
+            "config": output_config_from_metadata(metadata),
             "output": output.detach().cpu().contiguous(),
             "output_hash": tensor_sha256(output.detach().cpu().contiguous()),
         },
@@ -664,8 +702,8 @@ def cmd_check_outputs(args: argparse.Namespace) -> int:
         max_rel = 0.0
         case_passed = True
         for rank in range(metadata["config"]["world_size"]):
-            golden = load_case_output(torch, args.golden_case, rank)
-            candidate = load_case_output(torch, case_name, rank)
+            golden = load_case_output(torch, args.golden_case, rank, metadata)
+            candidate = load_case_output(torch, case_name, rank, metadata)
             metrics = compare_tensors(torch, golden, candidate, args.rtol, args.atol)
             max_abs = max(max_abs, float(metrics["max_abs_diff"]))
             mean_abs = max(mean_abs, float(metrics["mean_abs_diff"]))
@@ -691,14 +729,42 @@ def cmd_check_outputs(args: argparse.Namespace) -> int:
     return 0
 
 
-def load_case_output(torch, case_name: str, rank: int):
+def load_case_output(torch, case_name: str, rank: int, metadata: dict[str, Any]):
     path = OUTPUT_DIR / case_name / f"rank{rank}.pt"
     payload = torch.load(path, map_location="cpu", weights_only=False)
+    expected_artifact_hash = metadata["artifact_hash"]
+    actual_artifact_hash = payload.get("artifact_hash")
+    if actual_artifact_hash != expected_artifact_hash:
+        raise RuntimeError(
+            f"output artifact hash mismatch: {path}, "
+            f"expected {expected_artifact_hash}, got {actual_artifact_hash}"
+        )
+    expected_config = output_config_from_metadata(metadata)
+    actual_config = payload.get("config")
+    if actual_config != expected_config:
+        raise RuntimeError(f"output config mismatch: {path}")
     output = payload["output"]
     expected_hash = payload.get("output_hash")
     if expected_hash and tensor_sha256(output) != expected_hash:
         raise RuntimeError(f"output hash mismatch: {path}")
     return output
+
+
+def output_config_from_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    cfg = metadata["config"]
+    keys = [
+        "batch_size",
+        "world_size",
+        "hidden_size",
+        "moe_intermediate_size",
+        "num_experts",
+        "top_k",
+        "quant_mode",
+        "weight_source",
+        "layer_index",
+        "seed",
+    ]
+    return {key: cfg.get(key) for key in keys}
 
 
 def cmd_plot(args: argparse.Namespace) -> int:

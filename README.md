@@ -24,7 +24,7 @@
 
 `artifacts/pangu92_moe_weights_sync`
 
-这个目录不会进入 git.每次执行 `prepare` 都会覆盖旧 artifacts.
+这个目录不会进入 git. 每次执行 `prepare` 都会覆盖旧 artifacts.
 
 ## 2. A2 预验证快速命令
 
@@ -43,15 +43,15 @@ A2 只验证环境, artifacts, `pangu_chain`, output 和画图链路. 如果 vLL
 
 `ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 run_pangu92_three_case_experiment.py run-case --case-name pangu_chain --op-path pangu --determinism-repeat 2 --dump-output --warmup 2 --repeat 5 --output artifacts/pangu92_moe_weights_sync/results/a2_smoke.csv`
 
-4. 如果当前环境确实安装了 A3 `ascend910_93` custom op 包, 才跑当前环境里的 vLLM fused 算子:
+4. 可选: 如果当前环境确实安装了 A3 `ascend910_93` custom op 包, 才跑当前环境里的 vLLM fused 算子:
 
 `ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 run_pangu92_three_case_experiment.py run-case --case-name vllm_base --op-path vllm --determinism-repeat 2 --dump-output --warmup 2 --repeat 5 --output artifacts/pangu92_moe_weights_sync/results/a2_smoke.csv`
 
-5. 对比 output:
+5. 可选: 只有执行了上一步 vLLM fused case, 才对比 output:
 
 `python3 run_pangu92_three_case_experiment.py check-outputs --golden-case pangu_chain --case vllm_base --rtol 1e-2 --atol 1e-2`
 
-6. 生成图:
+6. 生成图. 如果只跑了 `pangu_chain`, 图里只会有一个 case, 这对 A2 smoke 是正常结果:
 
 `python3 run_pangu92_three_case_experiment.py plot --input artifacts/pangu92_moe_weights_sync/results/a2_smoke.csv`
 
@@ -71,6 +71,8 @@ Linux 桌面打开 PNG:
 
 A3 8 卡按 16 die 作为 16 rank 使用. 正式配置推荐 `num_experts=256`, 每 rank 16 experts.
 A3 vLLM-Ascend 必须用 `SOC_VERSION=ascend910_93` 构建. 验证 custom op 时需要执行 `enable_custom_op()`, 并显式 import `vllm_ascend.vllm_ascend_C`; 只 import `vllm_ascend` 不足以证明 `torch.ops._C_ascend.dispatch_gmm_combine_decode` 已注册. 这不是玄学, 只是懒加载.
+
+量化设置只有一个实验入口: `--quant-mode`, 默认值为 `2`. Pangu chain 中 `npu_moe_distribute_dispatch_v2` 使用这个值. `npu_dequant_swiglu_quant` 的 `quant_mode=1` 是该 op 自己的枚举, 用来复现 Pangu 链路里和 dispatch `quant_mode=2` 配套的 W8A8 (8-bit Weight, 8-bit Activation) decode 路径. vLLM fused case 仍显式传入同一个 `--quant-mode=2`.
 
 1. 生成正式 artifacts:
 
@@ -114,7 +116,9 @@ A3 vLLM-Ascend 必须用 `SOC_VERSION=ascend910_93` 构建. 验证 custom op 时
 
 `artifacts/pangu92_moe_weights_sync/plots/latency_summary.png`
 
-只有这些条件都满足, 才能看 timing:
+`--dump-output` 生成的每个 case output 会记录 `artifact_hash` 和关键 config. `check-outputs` 会校验这些字段, 防止把旧 artifacts 的输出拿来对比. 人会偷懒, hash 不会.
+
+正式 A3 对比只有这些条件都满足, 才能看 timing:
 
 1. `verify-artifacts` 通过
 2. 每个 case 的 `determinism_passed=True`

@@ -27,6 +27,7 @@ PANGU92_DEFAULTS = {
 }
 
 ACL_FORMAT_FRACTAL_NZ = 29
+PANGU_DEQUANT_SWIGLU_QUANT_MODE = 1
 
 
 @dataclass(frozen=True)
@@ -779,7 +780,9 @@ def make_pangu_operation(
             quant_scale=quant_scale,
             group_index=expert_tokens,
             activate_left=True,
-            quant_mode=1,
+            # This op uses its own enum. Keep it aligned with the Pangu chain that
+            # pairs dispatch quant_mode=2 with dequant_swiglu_quant quant_mode=1.
+            quant_mode=PANGU_DEQUANT_SWIGLU_QUANT_MODE,
         )
         down_proj_output = torch_npu.npu_grouped_matmul(
             [intermediate_h],

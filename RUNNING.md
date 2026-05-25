@@ -178,11 +178,11 @@ A2 预验证如果只安装 `SOC_VERSION=ascend910b1`, 只能验证环境, artif
 
 期望看到 PyTorch `2.9.0`, torch-npu `2.9.0.post2`, NPU 可用.
 
-确认 custom op:
+确认 custom op. 这一步用于 A3 fused decode 实验. 如果你在 A2 上只做 `pangu_chain` smoke, 可以跳过:
 
 `python3 -c "import importlib, torch, torch_npu; from vllm_ascend.utils import enable_custom_op; print(enable_custom_op()); importlib.import_module('vllm_ascend.vllm_ascend_C'); print(hasattr(torch.ops._C_ascend, 'dispatch_gmm_combine_decode'))"`
 
-期望两个输出都是 `True`.
+A3 环境期望两个输出都是 `True`. A2 `SOC_VERSION=ascend910b1` 环境里 Python op schema 可能可见, 但运行时仍可能因为 custom ops 包没有 `aclnnDispatchGmmCombineDecode` 而失败. 这不是你的手太笨, 是包里没有那块肉.
 
 如果后续运行时报 custom op 符号找不到, source vLLM-Ascend 安装产物里的 custom op 环境:
 
@@ -206,6 +206,8 @@ HTTPS:
 
 A2 只有 8 rank, 推荐先用 `num_experts=128`, 每 rank 16 experts.
 
+如果使用 `--model-path` 加载真实权重, `prepare` 会先判定整次实验使用 real 还是 synthetic. 判定后所有 rank 必须使用同一种来源. 不允许一部分 rank real, 一部分 rank synthetic, 这种混搭只会制造精致的废数据.
+
 生成 artifacts:
 
 `python3 run_pangu92_three_case_experiment.py prepare --batch-size 24 --world-size 8 --num-experts 128 --top-k 8 --quant-mode 2 --synthetic-fallback`
@@ -222,11 +224,11 @@ A2 只有 8 rank, 推荐先用 `num_experts=128`, 每 rank 16 experts.
 
 `ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 run_pangu92_three_case_experiment.py run-case --case-name vllm_base --op-path vllm --determinism-repeat 2 --dump-output --warmup 2 --repeat 5 --output artifacts/pangu92_moe_weights_sync/results/a2_smoke.csv`
 
-只有在该环境确实安装了包含 `DispatchGmmCombineDecode` ACLNN op 的 A3 custom op 包时, 才运行上面这条命令和后续 output 校验:
+只有在该环境确实安装了包含 `DispatchGmmCombineDecode` ACLNN op 的 A3 custom op 包时, 才运行上面这条命令和后续 output 校验. 如果跳过 vLLM fused case, 也跳过这条 output 校验:
 
 `python3 run_pangu92_three_case_experiment.py check-outputs --golden-case pangu_chain --case vllm_base --rtol 1e-2 --atol 1e-2`
 
-生成 PNG:
+生成 PNG. 如果只跑了 `pangu_chain`, 图里只有一个 case 是正常的 A2 预验证结果:
 
 `python3 run_pangu92_three_case_experiment.py plot --input artifacts/pangu92_moe_weights_sync/results/a2_smoke.csv`
 
@@ -270,6 +272,8 @@ A3 8 卡按 16 die 作为 16 rank 使用.
 
 `python3 run_pangu92_three_case_experiment.py check-outputs --golden-case pangu_chain --case vllm_base --case vllm_modified --rtol 1e-2 --atol 1e-2`
 
+`check-outputs` 会同时校验 output 里的 `artifact_hash` 和关键 config. 如果你重新执行过 `prepare`, 旧 output 会被判为 invalid. 这是故意的.
+
 生成图:
 
 `python3 run_pangu92_three_case_experiment.py plot --input artifacts/pangu92_moe_weights_sync/results/timing.csv`
@@ -280,11 +284,12 @@ A2 预验证通过标准:
 
 1. `npu-smi info` 可见 8 张 A2
 2. `torch.npu.is_available()` 为 `True`
-3. `dispatch_gmm_combine_decode` custom op 可见
-4. `verify-artifacts` 通过
-5. `pangu_chain` 和 `vllm_base` 的 `determinism_passed=True`
-6. `check-outputs` 通过
-7. `plot` 能生成 PNG
+3. `prepare` 和 `verify-artifacts` 通过
+4. `pangu_chain` 的 `determinism_passed=True`
+5. `pangu_chain` 能写出 timing CSV 和 output artifact
+6. `plot` 能生成 PNG
+
+A2 上 `dispatch_gmm_combine_decode` 和 `vllm_base` 属于可选验证. 只有当前环境安装的是包含 `DispatchGmmCombineDecode` ACLNN op 的 A3 custom op 包时, 才要求 `vllm_base` 确定性通过和 `check-outputs` 通过.
 
 A3 正式结论通过标准:
 
