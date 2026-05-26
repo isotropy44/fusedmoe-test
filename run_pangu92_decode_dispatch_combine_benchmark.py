@@ -827,6 +827,9 @@ def make_vllm_fused_operation(
 ):
     gmm1_scale = weights.w13_weight_scale.to(torch.float32)
     gmm2_scale = weights.w2_weight_scale.to(torch.float32)
+    x_active_mask = torch.ones(
+        (cfg.batch_size,), dtype=torch.bool, device=hidden_states.device
+    )
 
     def operation():
         output, _expert_token_nums = torch.ops._C_ascend.dispatch_gmm_combine_decode(
@@ -838,7 +841,7 @@ def make_vllm_fused_operation(
             gmm2_weight_scale=[gmm2_scale],
             expert_scales=topk_weights.to(torch.float32),
             expert_smooth_scales=None,
-            x_active_mask=None,
+            x_active_mask=x_active_mask,
             group_ep=runtime.group_ep,
             ep_rank_size=runtime.world_size,
             ep_rank_id=runtime.rank,
@@ -846,7 +849,7 @@ def make_vllm_fused_operation(
             shared_expert_num=1,
             shared_expert_rank_num=0,
             quant_mode=cfg.quant_mode,
-            global_bs=cfg.batch_size * runtime.world_size,
+            global_bs=0,
         )
         return output
 
