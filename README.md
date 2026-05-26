@@ -110,6 +110,8 @@ A3 vLLM-Ascend 必须用 `SOC_VERSION=ascend910_93` 构建. 验证 custom op 时
 
 `artifacts/pangu92_moe_weights_sync/results/output_check.csv`
 
+`artifacts/pangu92_moe_weights_sync/results/output_check_ranks.csv`
+
 `artifacts/pangu92_moe_weights_sync/results/summary.csv`
 
 `artifacts/pangu92_moe_weights_sync/plots/latency_boxplot.png`
@@ -117,6 +119,8 @@ A3 vLLM-Ascend 必须用 `SOC_VERSION=ascend910_93` 构建. 验证 custom op 时
 `artifacts/pangu92_moe_weights_sync/plots/latency_summary.png`
 
 `--dump-output` 生成的每个 case output 会记录 `artifact_hash` 和关键 config. `check-outputs` 会校验这些字段, 防止把旧 artifacts 的输出拿来对比. 人会偷懒, hash 不会.
+
+`timing.csv` 追加前会检查文件尾部 newline, header 和每行列数. 如果已有文件被拼坏, 脚本会拒绝继续追加, 请换一个新的 `--output` 路径或先修复旧 CSV.
 
 正式 A3 对比只有这些条件都满足, 才能看 timing:
 

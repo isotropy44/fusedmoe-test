@@ -42,6 +42,38 @@ TENSOR_NAMES = [
 CASE_NAMES = ["pangu_chain", "vllm_base", "vllm_modified"]
 DETERMINISM_RTOL = 1e-4
 DETERMINISM_ATOL = 1e-4
+TIMING_FIELDS = [
+    "case_name",
+    "op_path",
+    "sample_ms",
+    "count",
+    "mean_ms",
+    "median_ms",
+    "min_ms",
+    "max_ms",
+    "p90_ms",
+    "p99_ms",
+    "determinism_passed",
+    "determinism_max_abs_diff",
+    "determinism_max_rel_diff",
+    "determinism_rtol",
+    "determinism_atol",
+    "artifact_hash",
+    "batch_size",
+    "world_size",
+    "hidden_size",
+    "moe_intermediate_size",
+    "num_experts",
+    "local_experts",
+    "top_k",
+    "quant_mode",
+    "weight_source",
+    "torch_version",
+    "torch_npu_version",
+    "vllm_ascend_path",
+    "vllm_ascend_commit",
+    "ascend_rt_visible_devices",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -426,10 +458,13 @@ def cmd_run_case(args: argparse.Namespace) -> int:
     samples_ms = bench.measure(torch, cfg, operation)
     summary = bench.summarize(samples_ms)
     if bench.is_primary_rank(torch):
+        env = collect_env_metadata()
         append_timing_csv(args, cfg, metadata, samples_ms, summary, determinism)
         print(
             f"case={args.case_name} op_path={args.op_path} "
-            f"median_ms={summary['median_ms']:.6f} output={args.output}"
+            f"median_ms={summary['median_ms']:.6f} "
+            f"vllm_ascend_commit={env['vllm_ascend_commit']} "
+            f"output={args.output}"
         )
     return 0
 
@@ -588,40 +623,11 @@ def append_timing_csv(
     output.parent.mkdir(parents=True, exist_ok=True)
     exists = output.exists()
     env = collect_env_metadata()
-    fields = [
-        "case_name",
-        "op_path",
-        "sample_ms",
-        "count",
-        "mean_ms",
-        "median_ms",
-        "min_ms",
-        "max_ms",
-        "p90_ms",
-        "p99_ms",
-        "determinism_passed",
-        "determinism_max_abs_diff",
-        "determinism_max_rel_diff",
-        "determinism_rtol",
-        "determinism_atol",
-        "artifact_hash",
-        "batch_size",
-        "world_size",
-        "hidden_size",
-        "moe_intermediate_size",
-        "num_experts",
-        "local_experts",
-        "top_k",
-        "quant_mode",
-        "weight_source",
-        "torch_version",
-        "torch_npu_version",
-        "vllm_ascend_path",
-        "vllm_ascend_commit",
-        "ascend_rt_visible_devices",
-    ]
+    if exists:
+        ensure_csv_trailing_newline(output)
+        validate_timing_csv(output, TIMING_FIELDS)
     with output.open("a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
+        writer = csv.DictWriter(f, fieldnames=TIMING_FIELDS)
         if not exists:
             writer.writeheader()
         for sample in samples_ms:
@@ -649,6 +655,97 @@ def append_timing_csv(
             row.update(summary)
             row.update(env)
             writer.writerow(row)
+
+
+def ensure_csv_trailing_newline(path: Path) -> None:
+    if not path.exists() or path.stat().st_size == 0:
+        return
+    with path.open("rb+") as f:
+        f.seek(-1, os.SEEK_END)
+        if f.read(1) not in {b"\n", b"\r"}:
+            f.write(b"\n")
+
+
+def validate_timing_csv(path: Path, fields: list[str]) -> None:
+    with path.open("r", newline="") as f:
+        reader = csv.reader(f)
+        try:
+            header = next(reader)
+        except StopIteration:
+            return
+        if header != fields:
+            raise RuntimeError(
+                f"timing CSV header mismatch: {path}. "
+                "Use a new --output path or repair the existing CSV before append."
+            )
+        for line_no, row in enumerate(reader, start=2):
+            if not row:
+                continue
+            if len(row) != len(fields):
+                raise RuntimeError(
+                    f"timing CSV malformed at line {line_no}: expected "
+                    f"{len(fields)} columns, got {len(row)}. "
+                    "Use a new --output path or repair the existing CSV before append."
+                )
+            if row[0] not in CASE_NAMES:
+                raise RuntimeError(
+                    f"timing CSV malformed at line {line_no}: unknown case_name={row[0]!r}."
+                )
+            validate_timing_row_types(path, line_no, dict(zip(fields, row)))
+
+
+def validate_timing_row_types(path: Path, line_no: int, row: dict[str, str]) -> None:
+    if row["op_path"] not in {"pangu", "vllm"}:
+        raise RuntimeError(
+            f"timing CSV malformed at line {line_no}: unknown op_path={row['op_path']!r}."
+        )
+    for field in [
+        "batch_size",
+        "world_size",
+        "hidden_size",
+        "moe_intermediate_size",
+        "num_experts",
+        "local_experts",
+        "top_k",
+        "quant_mode",
+    ]:
+        try:
+            int(row[field])
+        except ValueError as exc:
+            raise RuntimeError(
+                f"timing CSV malformed at line {line_no}: field {field} "
+                f"must be int, got {row[field]!r}. "
+                "Use a new --output path or repair the existing CSV before append."
+            ) from exc
+    for field in [
+        "sample_ms",
+        "count",
+        "mean_ms",
+        "median_ms",
+        "min_ms",
+        "max_ms",
+        "p90_ms",
+        "p99_ms",
+        "determinism_max_abs_diff",
+        "determinism_max_rel_diff",
+        "determinism_rtol",
+        "determinism_atol",
+    ]:
+        try:
+            float(row[field])
+        except ValueError as exc:
+            raise RuntimeError(
+                f"timing CSV malformed at line {line_no}: field {field} "
+                f"must be float, got {row[field]!r}. "
+                "Use a new --output path or repair the existing CSV before append."
+            ) from exc
+    if row["determinism_passed"] not in {"True", "False"}:
+        raise RuntimeError(
+            f"timing CSV malformed at line {line_no}: determinism_passed "
+            f"must be True or False, got {row['determinism_passed']!r}."
+        )
+    if not row["artifact_hash"]:
+        raise RuntimeError(f"timing CSV malformed at line {line_no}: empty artifact_hash.")
 
 
 def collect_env_metadata() -> dict[str, str]:
@@ -707,20 +804,44 @@ def cmd_check_outputs(args: argparse.Namespace) -> int:
 
     metadata = load_metadata()
     rows = []
+    rank_rows = []
     all_passed = True
     for case_name in args.case:
         max_abs = 0.0
         mean_abs = 0.0
         max_rel = 0.0
+        worst_rank = -1
+        failed_ranks = []
         case_passed = True
         for rank in range(metadata["config"]["world_size"]):
             golden = load_case_output(torch, args.golden_case, rank, metadata)
             candidate = load_case_output(torch, case_name, rank, metadata)
             metrics = compare_tensors(torch, golden, candidate, args.rtol, args.atol)
-            max_abs = max(max_abs, float(metrics["max_abs_diff"]))
-            mean_abs = max(mean_abs, float(metrics["mean_abs_diff"]))
-            max_rel = max(max_rel, float(metrics["max_rel_diff"]))
-            case_passed = case_passed and bool(metrics["allclose"])
+            rank_max_abs = float(metrics["max_abs_diff"])
+            rank_mean_abs = float(metrics["mean_abs_diff"])
+            rank_max_rel = float(metrics["max_rel_diff"])
+            rank_allclose = bool(metrics["allclose"])
+            if rank_max_abs > max_abs:
+                worst_rank = rank
+            max_abs = max(max_abs, rank_max_abs)
+            mean_abs = max(mean_abs, rank_mean_abs)
+            max_rel = max(max_rel, rank_max_rel)
+            if not rank_allclose:
+                failed_ranks.append(str(rank))
+            rank_rows.append(
+                {
+                    "golden_case": args.golden_case,
+                    "case_name": case_name,
+                    "rank": rank,
+                    "output_allclose": rank_allclose,
+                    "max_abs_diff": rank_max_abs,
+                    "mean_abs_diff": rank_mean_abs,
+                    "max_rel_diff": rank_max_rel,
+                    "rtol": args.rtol,
+                    "atol": args.atol,
+                }
+            )
+            case_passed = case_passed and rank_allclose
         rows.append(
             {
                 "golden_case": args.golden_case,
@@ -729,13 +850,17 @@ def cmd_check_outputs(args: argparse.Namespace) -> int:
                 "max_abs_diff": max_abs,
                 "mean_abs_diff": mean_abs,
                 "max_rel_diff": max_rel,
+                "worst_rank": worst_rank,
+                "failed_ranks": "|".join(failed_ranks),
                 "rtol": args.rtol,
                 "atol": args.atol,
             }
         )
         all_passed = all_passed and case_passed
     write_rows(RESULT_DIR / "output_check.csv", rows)
+    write_rows(RESULT_DIR / "output_check_ranks.csv", rank_rows)
     print(f"wrote {RESULT_DIR / 'output_check.csv'}")
+    print(f"wrote {RESULT_DIR / 'output_check_ranks.csv'}")
     if not all_passed:
         return 1
     return 0
@@ -791,6 +916,7 @@ def cmd_plot(args: argparse.Namespace) -> int:
     timing_path = Path(args.input)
     if not timing_path.is_absolute():
         timing_path = ROOT / timing_path
+    validate_timing_csv(timing_path, TIMING_FIELDS)
     rows = read_csv_rows(timing_path)
     samples: dict[str, list[float]] = {}
     deterministic: dict[str, bool] = {}

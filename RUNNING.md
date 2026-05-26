@@ -152,11 +152,11 @@ openEuler / CentOS:
 
 A3 正式实验必须按 A3 SoC 构建:
 
-`SOC_VERSION=ascend910_93 pip install -v -e .`
+`SOC_VERSION=ascend910_9392 pip install -v -e .`
 
 如果遇到 build isolation 导致依赖环境混乱, 用:
 
-`SOC_VERSION=ascend910_93 pip install --no-build-isolation -v -e .`
+`SOC_VERSION=ascend910_9392 pip install --no-build-isolation -v -e .`
 
 如果 CANN 头文件报 `profiling/prof_api.h` 找不到, 先确认 `pkg_inc` 存在, 再把它加入编译 include path:
 
@@ -168,7 +168,7 @@ A3 正式实验必须按 A3 SoC 构建:
 
 如果 CANN 安装在个人目录, 把 `ASCEND_HOME` 改成 `/home/jhyang/Ascend/cann-9.0.0`. 这不高雅, 但比改系统 include 目录更像人类工程.
 
-A2 预验证如果只安装 `SOC_VERSION=ascend910b1`, 只能验证环境, artifacts, `pangu_chain` 和普通路径. `dispatch_gmm_combine_decode` 的 Ascend Computing Language Neural Network (ACLNN) custom op 只在 A3 `ascend910_93` 构建分支打包. 在 A2 上强跑 vLLM fused decode case, 常见结果是 Python op schema 可见, 运行时 `libopapi.so` 找不到 `aclnnDispatchGmmCombineDecode` 符号.
+A2 预验证如果只安装 `SOC_VERSION=ascend910b1`, 只能验证环境, artifacts, `pangu_chain` 和普通路径. `dispatch_gmm_combine_decode` 的 Ascend Computing Language Neural Network (ACLNN) custom op 只在 A3 `ascend910_9392` 构建分支打包. 在 A2 上强跑 vLLM fused decode case, 常见结果是 Python op schema 可见, 运行时 `libopapi.so` 找不到 `aclnnDispatchGmmCombineDecode` 符号.
 
 ## 8. 验证环境
 
@@ -258,21 +258,25 @@ A3 8 卡按 16 die 作为 16 rank 使用.
 
 跑 `pangu_chain`:
 
-`ASCEND_RT_VISIBLE_DEVICES=0,1,...,15 python3 run_pangu92_three_case_experiment.py run-case --case-name pangu_chain --op-path pangu --determinism-repeat 3 --dump-output --warmup 20 --repeat 100 --output artifacts/pangu92_moe_weights_sync/results/timing.csv`
+`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 python3 run_pangu92_three_case_experiment.py run-case --case-name pangu_chain --op-path pangu --determinism-repeat 3 --dump-output --warmup 20 --repeat 100 --output artifacts/pangu92_moe_weights_sync/results/timing.csv`
 
 在未修改 vLLM-Ascend 环境跑 `vllm_base`:
 
-`ASCEND_RT_VISIBLE_DEVICES=0,1,...,15 python3 run_pangu92_three_case_experiment.py run-case --case-name vllm_base --op-path vllm --determinism-repeat 3 --dump-output --warmup 20 --repeat 100 --output artifacts/pangu92_moe_weights_sync/results/timing.csv`
+`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 python3 run_pangu92_three_case_experiment.py run-case --case-name vllm_base --op-path vllm --determinism-repeat 3 --dump-output --warmup 20 --repeat 100 --output artifacts/pangu92_moe_weights_sync/results/timing.csv`
+
+跑完后核对终端输出或 `timing.csv` 中的 `vllm_ascend_commit`. `vllm_base` 只是标签, 当前环境如果其实是修改版 checkout, 结果也会被写成 `vllm_base`.
 
 在修改版 vLLM-Ascend 环境跑 `vllm_modified`:
 
-`ASCEND_RT_VISIBLE_DEVICES=0,1,...,15 python3 run_pangu92_three_case_experiment.py run-case --case-name vllm_modified --op-path vllm --determinism-repeat 3 --dump-output --warmup 20 --repeat 100 --output artifacts/pangu92_moe_weights_sync/results/timing.csv`
+`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 python3 run_pangu92_three_case_experiment.py run-case --case-name vllm_modified --op-path vllm --determinism-repeat 3 --dump-output --warmup 20 --repeat 100 --output artifacts/pangu92_moe_weights_sync/results/timing.csv`
 
 跨 case output 校验:
 
 `python3 run_pangu92_three_case_experiment.py check-outputs --golden-case pangu_chain --case vllm_base --case vllm_modified --rtol 1e-2 --atol 1e-2`
 
 `check-outputs` 会同时校验 output 里的 `artifact_hash` 和关键 config. 如果你重新执行过 `prepare`, 旧 output 会被判为 invalid. 这是故意的.
+
+如果 `output_allclose=False`, 先看 `artifacts/pangu92_moe_weights_sync/results/output_check_ranks.csv`. 这个文件会列出每个 rank 的 `max_abs_diff`, `mean_abs_diff`, `max_rel_diff`, 以及该 rank 是否 allclose.
 
 生成图:
 

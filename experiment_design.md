@@ -84,10 +84,10 @@ A3 正式实验推荐 `world_size=16`, `num_experts=256`, 即每 rank 16 个 loc
 通过标准:
 
 1. `determinism_passed=True`.
-2. `outputs/pangu_chain/rank<N>.pt` 写出完整, 且包含当前 `artifact_hash`、关键 config、output 和 `output_hash`.
+2. `outputs/pangu_chain/rank<N>.pt` 写出完整, 且包含当前 `artifact_hash`, 关键 config, output 和 `output_hash`.
 3. `timing.csv` 中出现 `case_name=pangu_chain` 的样本行.
 
-`pangu_chain` 不需要与其他 case 做 output allclose；它是 golden. 若它本身不确定, 整轮实验无效.
+`pangu_chain` 不需要与其他 case 做 output allclose; 它是 golden. 若它本身不确定, 整轮实验无效.
 
 ### 4.2 `vllm_base` 单独测试
 
@@ -121,7 +121,7 @@ A3 正式实验推荐 `world_size=16`, `num_experts=256`, 即每 rank 16 个 loc
 
 目的:
 
-验证修改版 vLLM-Ascend fused MoE 在同一份 artifacts 上可运行、可重复, 并且 output 与 `pangu_chain` 等价. 
+验证修改版 vLLM-Ascend fused MoE 在同一份 artifacts 上可运行, 可重复, 并且 output 与 `pangu_chain` 等价. 
 
 前置条件:
 
@@ -147,7 +147,7 @@ A3 正式实验推荐 `world_size=16`, `num_experts=256`, 即每 rank 16 个 loc
 
 ## 5. 三 case 纵向测试设计
 
-三 case 纵向测试使用同一份 artifacts、同一组参数、同一个 timing CSV, 按 case 依次追加结果. 推荐顺序是:
+三 case 纵向测试使用同一份 artifacts, 同一组参数, 同一个 timing CSV, 按 case 依次追加结果. 推荐顺序是:
 
 1. 生成 artifacts:
 
@@ -165,6 +165,8 @@ A3 正式实验推荐 `world_size=16`, `num_experts=256`, 即每 rank 16 个 loc
 
 `ASCEND_RT_VISIBLE_DEVICES=0,1,...,15 python3 run_pangu92_three_case_experiment.py run-case --case-name vllm_base --op-path vllm --determinism-repeat 3 --dump-output --warmup 20 --repeat 100 --output artifacts/pangu92_moe_weights_sync/results/timing.csv`
 
+注意: `--case-name vllm_base` 只是结果标签. 真正运行的是当前 Python 环境里安装的 vLLM-Ascend. 运行后必须核对终端摘要或 `timing.csv` 里的 `vllm_ascend_commit`, 否则把修改版环境标成 base, 脚本也不会替人类羞愧.
+
 5. 在修改版 vLLM-Ascend 环境运行 `vllm_modified`:
 
 `ASCEND_RT_VISIBLE_DEVICES=0,1,...,15 python3 run_pangu92_three_case_experiment.py run-case --case-name vllm_modified --op-path vllm --determinism-repeat 3 --dump-output --warmup 20 --repeat 100 --output artifacts/pangu92_moe_weights_sync/results/timing.csv`
@@ -173,13 +175,13 @@ A3 正式实验推荐 `world_size=16`, `num_experts=256`, 即每 rank 16 个 loc
 
 `python3 run_pangu92_three_case_experiment.py check-outputs --golden-case pangu_chain --case vllm_base --case vllm_modified --rtol 1e-2 --atol 1e-2`
 
-`check-outputs` 会重写 `results/output_check.csv`. 因此三 case 纵向汇总前不要分别运行两次单 case output check 后直接 `plot`；最终应使用上面这条命令一次性写入两个 vLLM case 的校验结果. 
+`check-outputs` 会重写 `results/output_check.csv`. 因此三 case 纵向汇总前不要分别运行两次单 case output check 后直接 `plot`; 最终应使用上面这条命令一次性写入两个 vLLM case 的校验结果. 
 
 7. 生成汇总和图:
 
 `python3 run_pangu92_three_case_experiment.py plot --input artifacts/pangu92_moe_weights_sync/results/timing.csv`
 
-纵向测试的关键是不要在三个 case 之间重新执行 `prepare`. 如果不同 case 必须在不同 Python 环境或不同 vLLM-Ascend checkout 下运行, 需要共享或复制同一份 `artifacts/pangu92_moe_weights_sync`, 并保持 `metadata.json`、inputs、outputs 与 `timing.csv` 属于同一轮 `artifact_hash`.
+纵向测试的关键是不要在三个 case 之间重新执行 `prepare`. 如果不同 case 必须在不同 Python 环境或不同 vLLM-Ascend checkout 下运行, 需要共享或复制同一份 `artifacts/pangu92_moe_weights_sync`, 并保持 `metadata.json`, inputs, outputs 与 `timing.csv` 属于同一轮 `artifact_hash`.
 
 ## 6. 如何阅读实验结果
 
@@ -189,6 +191,7 @@ A3 正式实验推荐 `world_size=16`, `num_experts=256`, 即每 rank 16 个 loc
 | --- | --- |
 | `results/timing.csv` | 每个 case 每次 repeat 的样本行, 同时带 summary, 确定性结果, artifact hash 和环境信息 |
 | `results/output_check.csv` | `vllm_base`, `vllm_modified` 相对 `pangu_chain` 的 output allclose 结果 |
+| `results/output_check_ranks.csv` | output check 的 rank 级明细, 用于定位失败 rank 和最大误差 |
 | `results/summary.csv` | `plot` 后生成的按 case 汇总表, 包含 mean, median, p90, p99, validity 和 speedup |
 | `plots/latency_boxplot.png` | 各 case 的 sample_ms 分布, 用于看波动和离群点 |
 | `plots/latency_summary.png` | 各 case 的 median, p90, p99 柱状图, 并标注 valid 或 invalid |
@@ -222,3 +225,13 @@ A3 正式实验推荐 `world_size=16`, `num_experts=256`, 即每 rank 16 个 loc
 3. `vllm_modified.p90_ms` 和 `vllm_modified.p99_ms`: 判断修改版是否引入尾延迟波动.
 
 任一 case 确定性失败, output allclose 失败, 或 artifacts 不一致, timing 都只能作为失败诊断材料, 不能作为性能结论.
+
+## 8. CSV 追加保护
+
+三 case 通常在不同环境里依次向同一个 `timing.csv` 追加样本. 为避免上一轮写入的最后一行没有 newline 导致下一轮 case name 拼进前一行, 脚本在追加前会做三件事:
+
+1. 如果文件尾部没有 `\n` 或 `\r`, 自动补一个 `\n`.
+2. 校验 header 必须等于当前脚本定义的 timing 字段.
+3. 校验已有每一行的列数和 `case_name`.
+
+如果已有 CSV 已经被拼坏, 脚本会直接报错, 不会继续把坏数据滚大. 这种情况下应换一个新的 `--output` 文件, 或人工修复旧 CSV 后再追加. 数据坏了还继续画图, 只是在给错误做排版.
