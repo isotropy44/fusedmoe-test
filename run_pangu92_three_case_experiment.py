@@ -1114,6 +1114,8 @@ def make_boxplot(plt, samples: dict[str, list[float]], output: Path) -> None:
 
 def make_summary_plot(plt, summaries: list[dict[str, Any]], output: Path) -> None:
     labels = [row["case_name"] for row in summaries]
+    by_case = {row["case_name"]: row for row in summaries}
+    pangu_summary = by_case.get("pangu_chain", {})
     x = range(len(labels))
     width = 0.25
     fig, ax = plt.subplots(figsize=(9, 4.8))
@@ -1121,16 +1123,19 @@ def make_summary_plot(plt, summaries: list[dict[str, Any]], output: Path) -> Non
         positions = [i + offset for i in x]
         values = [row[key] for row in summaries]
         bars = ax.bar(positions, values, width, label=key)
-        for bar, value in zip(bars, values):
+        for bar, row, value in zip(bars, summaries, values):
+            label = f"{float(value):.3f}"
+            pangu_value = float(pangu_summary.get(key, 0.0) or 0.0)
+            if row["case_name"] in {"vllm_base", "vllm_modified"} and float(value) > 0 and pangu_value > 0:
+                label = f"{label}\n{pangu_value / float(value):.2f}x"
             ax.annotate(
-                f"{float(value):.3f}",
+                label,
                 xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
                 xytext=(0, 3),
                 textcoords="offset points",
                 ha="center",
                 va="bottom",
                 fontsize=7,
-                rotation=90,
             )
     for i, row in enumerate(summaries):
         valid = row["determinism_passed"] and row["output_allclose"]
@@ -1144,7 +1149,7 @@ def make_summary_plot(plt, summaries: list[dict[str, Any]], output: Path) -> Non
         default=0.0,
     )
     if max_value > 0:
-        ax.set_ylim(top=max_value * 1.18)
+        ax.set_ylim(top=max_value * 1.25)
     ax.set_xticks(list(x))
     ax.set_xticklabels(labels)
     ax.set_ylabel("ms")
