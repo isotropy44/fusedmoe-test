@@ -154,6 +154,7 @@ def main() -> int:
 def cmd_prepare(args: argparse.Namespace) -> int:
     import torch
 
+    before_files = snapshot_tree(ARTIFACT_DIR)
     cfg = config_from_prepare_args(args)
     validate_artifact_config(cfg)
     if ARTIFACT_DIR.exists():
@@ -185,6 +186,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     write_json(METADATA_PATH, metadata)
     print(f"prepared artifacts: {ARTIFACT_DIR}")
     print(f"artifact_hash={metadata['artifact_hash']}")
+    print_file_change_summary(classify_file_changes(before_files, snapshot_tree(ARTIFACT_DIR), set()))
     return 0
 
 
@@ -375,6 +377,7 @@ def build_real_rank_weights(torch, cfg: dict[str, Any], rank: int) -> dict[str, 
 def cmd_verify_artifacts() -> int:
     import torch
 
+    before_files = snapshot_tree(ARTIFACT_DIR)
     metadata = load_metadata()
     cfg = metadata["config"]
     validate_artifact_config(cfg)
@@ -390,8 +393,13 @@ def cmd_verify_artifacts() -> int:
                 failures.append(f"rank={rank} tensor={name}")
     if failures:
         raise RuntimeError("artifact verification failed: " + ", ".join(failures))
+    print(
+        "PASS: artifact verification passed "
+        f"ranks={cfg['world_size']} tensors_per_rank={len(TENSOR_NAMES)}"
+    )
     print(f"verified artifacts: {ARTIFACT_DIR}")
     print(f"artifact_hash={metadata['artifact_hash']}")
+    print_file_change_summary(classify_file_changes(before_files, snapshot_tree(ARTIFACT_DIR), set()))
     return 0
 
 
@@ -406,6 +414,8 @@ def cmd_run_case(args: argparse.Namespace) -> int:
     cfg = make_bench_config(cfg_dict, args)
     bench.validate_config(cfg)
     bench.ensure_vllm_custom_op(torch, cfg)
+    tracked_paths = run_case_tracked_paths(args, cfg.world_size)
+    before_files = snapshot_paths(tracked_paths)
     runtime = bench.init_distributed(torch, dist, cfg.world_size)
     if runtime.world_size != cfg.world_size:
         raise ValueError(
@@ -466,6 +476,13 @@ def cmd_run_case(args: argparse.Namespace) -> int:
             f"vllm_ascend_commit={env['vllm_ascend_commit']} "
             f"output={args.output}"
         )
+        print_file_change_summary(
+            classify_file_changes(
+                before_files,
+                snapshot_paths(tracked_paths),
+                {resolve_output_path(args.output)},
+            )
+        )
     return 0
 
 
@@ -481,6 +498,8 @@ def launch_torchrun(args: argparse.Namespace) -> int:
     if torchrun is None:
         raise RuntimeError("torchrun is not found in PATH")
     metadata = load_metadata()
+    tracked_paths = run_case_tracked_paths(args, int(metadata["config"]["world_size"]))
+    before_files = snapshot_paths(tracked_paths)
     script = Path(__file__).resolve()
     forwarded = [arg for arg in sys.argv[1:] if arg != "--no-torchrun"]
     cmd = [
@@ -494,7 +513,16 @@ def launch_torchrun(args: argparse.Namespace) -> int:
         *forwarded,
         "--no-torchrun",
     ]
-    return subprocess.run(cmd, check=False).returncode
+    result = subprocess.run(cmd, check=False)
+    if result.returncode != 0:
+        print_file_change_summary(
+            classify_file_changes(
+                before_files,
+                snapshot_paths(tracked_paths),
+                {resolve_output_path(args.output)},
+            )
+        )
+    return result.returncode
 
 
 def make_bench_config(cfg: dict[str, Any], args: argparse.Namespace) -> bench.BenchConfig:
@@ -802,6 +830,11 @@ def git_commit(repo: Path) -> str:
 def cmd_check_outputs(args: argparse.Namespace) -> int:
     import torch
 
+    tracked_paths = [
+        RESULT_DIR / "output_check.csv",
+        RESULT_DIR / "output_check_ranks.csv",
+    ]
+    before_files = snapshot_paths(tracked_paths)
     metadata = load_metadata()
     rows = []
     rank_rows = []
@@ -861,6 +894,10 @@ def cmd_check_outputs(args: argparse.Namespace) -> int:
     write_rows(RESULT_DIR / "output_check_ranks.csv", rank_rows)
     print(f"wrote {RESULT_DIR / 'output_check.csv'}")
     print(f"wrote {RESULT_DIR / 'output_check_ranks.csv'}")
+    print_output_check_result(rows)
+    print_file_change_summary(
+        classify_file_changes(before_files, snapshot_paths(tracked_paths), set())
+    )
     if not all_passed:
         return 1
     return 0
@@ -916,6 +953,12 @@ def cmd_plot(args: argparse.Namespace) -> int:
     timing_path = Path(args.input)
     if not timing_path.is_absolute():
         timing_path = ROOT / timing_path
+    tracked_paths = [
+        RESULT_DIR / "summary.csv",
+        PLOT_DIR / "latency_boxplot.png",
+        PLOT_DIR / "latency_summary.png",
+    ]
+    before_files = snapshot_paths(tracked_paths)
     validate_timing_csv(timing_path, TIMING_FIELDS)
     rows = read_csv_rows(timing_path)
     samples: dict[str, list[float]] = {}
@@ -947,6 +990,10 @@ def cmd_plot(args: argparse.Namespace) -> int:
     print(f"wrote {PLOT_DIR / 'latency_boxplot.png'}")
     print(f"wrote {PLOT_DIR / 'latency_summary.png'}")
     print(f"wrote {RESULT_DIR / 'summary.csv'}")
+    print_timing_comparison(timing_path, summaries)
+    print_file_change_summary(
+        classify_file_changes(before_files, snapshot_paths(tracked_paths), set())
+    )
     return 0
 
 
@@ -958,6 +1005,68 @@ def read_output_status() -> dict[str, bool]:
         row["case_name"]: str(row["output_allclose"]).lower() == "true"
         for row in read_csv_rows(path)
     }
+
+
+def print_output_check_result(rows: list[dict[str, Any]]) -> None:
+    print("output 校验结果:")
+    if all(bool(row["output_allclose"]) for row in rows):
+        case_names = ", ".join(str(row["case_name"]) for row in rows)
+        print(f"  PASS: allclose passed for {case_names}")
+        return
+    for row in rows:
+        status = "PASS" if row["output_allclose"] else "FAIL"
+        print(
+            f"  {status}: {row['case_name']} "
+            f"max_abs_diff={float(row['max_abs_diff']):.6g} "
+            f"mean_abs_diff={float(row['mean_abs_diff']):.6g} "
+            f"max_rel_diff={float(row['max_rel_diff']):.6g} "
+            f"failed_ranks={row['failed_ranks'] or '-'}"
+        )
+
+
+def print_timing_comparison(timing_path: Path, summaries: list[dict[str, Any]]) -> None:
+    by_case = {row["case_name"]: row for row in summaries}
+    if not summaries:
+        print(f"时间指标: no samples in {display_path(timing_path)}")
+        return
+    print(f"时间指标: source={display_path(timing_path)}")
+    for case_name in CASE_NAMES:
+        summary = by_case.get(case_name)
+        if summary is None:
+            print(f"  {case_name}: missing")
+            continue
+        print(
+            f"  {case_name}: "
+            f"median_ms={summary['median_ms']:.6f} "
+            f"p90_ms={summary['p90_ms']:.6f} "
+            f"p99_ms={summary['p99_ms']:.6f}"
+        )
+    print_speedup_line("vllm_base", "pangu_chain", by_case)
+    print_speedup_line("vllm_modified", "pangu_chain", by_case)
+    print_speedup_line("vllm_modified", "vllm_base", by_case)
+
+
+def print_speedup_line(
+    target_case: str,
+    baseline_case: str,
+    summaries: dict[str, dict[str, float]],
+) -> None:
+    target = summaries.get(target_case)
+    baseline = summaries.get(baseline_case)
+    if target is None or baseline is None:
+        print(f"  speedup {target_case} vs {baseline_case}: missing")
+        return
+    target_median = float(target["median_ms"])
+    baseline_median = float(baseline["median_ms"])
+    if target_median <= 0 or baseline_median <= 0:
+        print(f"  speedup {target_case} vs {baseline_case}: invalid")
+        return
+    speedup = baseline_median / target_median
+    reduction = (1.0 - target_median / baseline_median) * 100.0
+    print(
+        f"  speedup {target_case} vs {baseline_case}: "
+        f"{speedup:.6f}x latency_reduction={reduction:.2f}%"
+    )
 
 
 def summarize_values(values: list[float]) -> dict[str, float]:
@@ -1009,10 +1118,33 @@ def make_summary_plot(plt, summaries: list[dict[str, Any]], output: Path) -> Non
     width = 0.25
     fig, ax = plt.subplots(figsize=(9, 4.8))
     for offset, key in [(-width, "median_ms"), (0, "p90_ms"), (width, "p99_ms")]:
-        ax.bar([i + offset for i in x], [row[key] for row in summaries], width, label=key)
+        positions = [i + offset for i in x]
+        values = [row[key] for row in summaries]
+        bars = ax.bar(positions, values, width, label=key)
+        for bar, value in zip(bars, values):
+            ax.annotate(
+                f"{float(value):.3f}",
+                xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                xytext=(0, 3),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=7,
+                rotation=90,
+            )
     for i, row in enumerate(summaries):
         valid = row["determinism_passed"] and row["output_allclose"]
         ax.text(i, 0, "valid" if valid else "invalid", ha="center", va="bottom", fontsize=8)
+    max_value = max(
+        (
+            float(row[key])
+            for row in summaries
+            for key in ["median_ms", "p90_ms", "p99_ms"]
+        ),
+        default=0.0,
+    )
+    if max_value > 0:
+        ax.set_ylim(top=max_value * 1.18)
     ax.set_xticks(list(x))
     ax.set_xticklabels(labels)
     ax.set_ylabel("ms")
@@ -1045,6 +1177,115 @@ def artifact_hash(metadata: dict[str, Any]) -> str:
 
 def rank_input_path(rank: int) -> Path:
     return INPUT_DIR / f"rank{rank}.pt"
+
+
+def run_case_tracked_paths(args: argparse.Namespace, world_size: int) -> list[Path]:
+    paths = [resolve_output_path(args.output)]
+    if args.dump_output:
+        paths.extend(OUTPUT_DIR / args.case_name / f"rank{rank}.pt" for rank in range(world_size))
+    return paths
+
+
+def resolve_output_path(path_value: str) -> Path:
+    path = Path(path_value)
+    if not path.is_absolute():
+        path = ROOT / path
+    return normalize_path(path)
+
+
+def normalize_path(path: Path) -> Path:
+    path = Path(path).expanduser()
+    if not path.is_absolute():
+        path = ROOT / path
+    return path.resolve(strict=False)
+
+
+def snapshot_tree(root: Path) -> dict[Path, dict[str, Any]]:
+    root = normalize_path(root)
+    if not root.exists():
+        return {}
+    return snapshot_paths(path for path in root.rglob("*") if path.is_file())
+
+
+def snapshot_paths(paths) -> dict[Path, dict[str, Any]]:
+    snapshot = {}
+    for path in paths:
+        normalized = normalize_path(path)
+        snapshot[normalized] = file_state(normalized)
+    return snapshot
+
+
+def file_state(path: Path) -> dict[str, Any]:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return {"exists": False, "size": 0, "mtime_ns": 0}
+    return {
+        "exists": path.is_file(),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def classify_file_changes(
+    before: dict[Path, dict[str, Any]],
+    after: dict[Path, dict[str, Any]],
+    appended_paths: set[Path],
+) -> dict[str, list[Path]]:
+    appended_paths = {normalize_path(path) for path in appended_paths}
+    changes = {
+        "appended": [],
+        "overwritten": [],
+        "created": [],
+        "deleted": [],
+    }
+    for path in sorted(set(before) | set(after), key=lambda item: str(item)):
+        previous = before.get(path, {"exists": False, "size": 0, "mtime_ns": 0})
+        current = after.get(path, {"exists": False, "size": 0, "mtime_ns": 0})
+        if not previous["exists"] and current["exists"]:
+            changes["created"].append(path)
+        elif previous["exists"] and not current["exists"]:
+            changes["deleted"].append(path)
+        elif previous["exists"] and current["exists"] and file_state_changed(previous, current):
+            if path in appended_paths and current["size"] >= previous["size"]:
+                changes["appended"].append(path)
+            else:
+                changes["overwritten"].append(path)
+    return changes
+
+
+def file_state_changed(previous: dict[str, Any], current: dict[str, Any]) -> bool:
+    return (
+        previous["size"] != current["size"]
+        or previous["mtime_ns"] != current["mtime_ns"]
+    )
+
+
+def print_file_change_summary(changes: dict[str, list[Path]]) -> None:
+    labels = [
+        ("追加", "appended"),
+        ("覆盖", "overwritten"),
+        ("新增", "created"),
+        ("删掉", "deleted"),
+    ]
+    print("文件变更:")
+    if not any(changes[key] for _, key in labels):
+        print("  无")
+        return
+    for label, key in labels:
+        if not changes[key]:
+            continue
+        print(f"  {label}:")
+        for path in changes[key]:
+            print(f"    - {display_path(path)}")
+
+
+def display_path(path: Path) -> str:
+    path = normalize_path(path)
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
 
 
 def load_metadata() -> dict[str, Any]:
