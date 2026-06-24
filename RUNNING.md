@@ -282,7 +282,41 @@ A3 8 卡按 16 die 作为 16 rank 使用.
 
 `python3 run_pangu92_three_case_experiment.py plot --input artifacts/pangu92_moe_weights_sync/results/timing.csv`
 
-## 12. 通过标准
+## 12. A3 device profiling
+
+profiling 必须复用正式实验的同一份 artifacts, 不要在 3 个 case 之间重新执行 `prepare`.
+
+采集 `pangu_chain`:
+
+`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 python3 run_pangu92_three_case_experiment.py run-case --case-name pangu_chain --op-path pangu --determinism-repeat 3 --warmup 20 --repeat 16 --profile`
+
+在未修改 vLLM-Ascend 环境采集 `vllm_base`:
+
+`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 python3 run_pangu92_three_case_experiment.py run-case --case-name vllm_base --op-path vllm --determinism-repeat 3 --warmup 20 --repeat 16 --profile`
+
+在修改版 vLLM-Ascend 环境采集 `vllm_modified`:
+
+`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 python3 run_pangu92_three_case_experiment.py run-case --case-name vllm_modified --op-path vllm --determinism-repeat 3 --warmup 20 --repeat 100 --profile --profile-repeat 16`
+
+规则:
+
+1. `--profile` 显式开启 profiling.
+2. 未指定 `--profile-repeat` 时, 使用 `--repeat` 作为采集轮数.
+3. profiling 前执行 `--warmup` 轮 operation.
+4. profiling 模式不执行普通 event timing, 不写 `results/timing.csv`.
+5. trace 输出在 `artifacts/pangu92_moe_weights_sync/profiles/<case_name>/`.
+6. 每个 rank 输出到 `<case_name>/rank_<N>/`, 同时使用 `rank_<N>` worker name, 不会互相覆盖.
+7. profiling 会引入采集开销. 只比较 trace 内的 device kernel 和通信耗时, 正式端到端结论仍使用非 profiling 模式的 timing CSV.
+
+性能数据可能较大. 采集前检查磁盘空间:
+
+`df -h artifacts/pangu92_moe_weights_sync`
+
+查找各 rank 的 device kernel 明细:
+
+`find artifacts/pangu92_moe_weights_sync/profiles -name kernel_details.csv -print`
+
+## 13. 通过标准
 
 A2 预验证通过标准:
 

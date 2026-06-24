@@ -102,7 +102,33 @@ A3 vLLM-Ascend 必须用 `SOC_VERSION=ascend910_93` 构建. 验证 custom op 时
 
 `python3 run_pangu92_three_case_experiment.py plot --input artifacts/pangu92_moe_weights_sync/results/timing.csv`
 
-## 4. 结果怎么看
+## 4. Device profiling
+
+`run-case` 增加了 `--profile`. 开启后仍会先做确定性校验和 `--warmup`, 随后使用 `torch_npu.profiler` 采集 device trace. profiling 模式跳过普通计时, 不追加 `timing.csv`.
+
+未指定 `--profile-repeat` 时, 采集轮数等于 `--repeat`. 例如下面会预热 20 轮, 再采集 16 轮:
+
+`ASCEND_RT_VISIBLE_DEVICES=0,1,...,15 python3 run_pangu92_three_case_experiment.py run-case --case-name pangu_chain --op-path pangu --determinism-repeat 3 --warmup 20 --repeat 16 --profile`
+
+显式指定采集轮数:
+
+`ASCEND_RT_VISIBLE_DEVICES=0,1,...,15 python3 run_pangu92_three_case_experiment.py run-case --case-name vllm_base --op-path vllm --determinism-repeat 3 --warmup 20 --repeat 100 --profile --profile-repeat 16`
+
+3 个 case 分别输出到:
+
+`artifacts/pangu92_moe_weights_sync/profiles/pangu_chain/`
+
+`artifacts/pangu92_moe_weights_sync/profiles/vllm_base/`
+
+`artifacts/pangu92_moe_weights_sync/profiles/vllm_modified/`
+
+多 rank 数据分别放在 `<case_name>/rank_<N>/`, 并通过 `rank_<N>` worker name 区分 trace. 比较 device 侧耗时时, 在 trace 中查看对应 NPU kernel 和通信任务, 不要使用开启 profiling 后的 Python 墙钟时间替代正式 timing 数据.
+
+查找解析后的 kernel 明细:
+
+`find artifacts/pangu92_moe_weights_sync/profiles -name kernel_details.csv -print`
+
+## 5. 结果怎么看
 
 关键输出:
 
@@ -117,6 +143,8 @@ A3 vLLM-Ascend 必须用 `SOC_VERSION=ascend910_93` 构建. 验证 custom op 时
 `artifacts/pangu92_moe_weights_sync/plots/latency_boxplot.png`
 
 `artifacts/pangu92_moe_weights_sync/plots/latency_summary.png`
+
+`artifacts/pangu92_moe_weights_sync/profiles/<case_name>/rank_<N>/`
 
 `--dump-output` 生成的每个 case output 会记录 `artifact_hash` 和关键 config. `check-outputs` 会校验这些字段, 防止把旧 artifacts 的输出拿来对比. 人会偷懒, hash 不会.
 

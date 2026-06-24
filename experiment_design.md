@@ -55,7 +55,7 @@ A3 正式实验推荐 `world_size=16`, `num_experts=256`, 即每 rank 16 个 loc
 
 1. `prepare`: 生成固定 artifacts, 并写入 `metadata.json` 与 `artifact_hash`.
 2. `verify-artifacts`: 重新读取每个 rank 的 tensor, 校验 tensor hash 与 metadata 一致.
-3. `run-case`: 单独运行一个 case. 脚本先做确定性校验, 确定性通过后才 dump output 并计时.
+3. `run-case`: 单独运行一个 case. 脚本先做确定性校验, 确定性通过后才 dump output 并计时. 指定 `--profile` 时改为 warmup 后采集 device trace, 不执行普通计时.
 4. `check-outputs`: 以 `pangu_chain` 为 golden, 对 `vllm_base` 和 `vllm_modified` 的 output 做 allclose 校验.
 5. `plot`: 汇总 timing CSV, 生成 `summary.csv`, boxplot 和 latency summary 图.
 
@@ -196,6 +196,7 @@ A3 正式实验推荐 `world_size=16`, `num_experts=256`, 即每 rank 16 个 loc
 | `plots/latency_boxplot.png` | 各 case 的 sample_ms 分布, 用于看波动和离群点 |
 | `plots/latency_summary.png` | 各 case 的 median, p90, p99 柱状图, 并标注 valid 或 invalid |
 | `outputs/<case>/rank<N>.pt` | `--dump-output` 保存的每 rank output, `artifact_hash`, 关键 config 和 `output_hash` |
+| `profiles/<case>/` | `torch_npu.profiler` 生成的多 rank device profiling 数据 |
 
 正式读数顺序:
 
@@ -217,6 +218,8 @@ A3 正式实验推荐 `world_size=16`, `num_experts=256`, 即每 rank 16 个 loc
 | --- | --- | --- |
 | `speedup_vs_pangu_chain_median` | `pangu_chain.median_ms / case.median_ms` | 大于 1 表示该 case 比 Pangu 链路快 |
 | `speedup_vs_vllm_base_median` | `vllm_base.median_ms / case.median_ms` | 对 `vllm_modified` 大于 1 表示修改版比未修改版快 |
+
+profiling 模式只用于拆解 device kernel 和通信任务. 它在 `--warmup` 后采集 `--profile-repeat` 轮, 未指定时使用 `--repeat`. profiling 采集会引入额外开销, 因此 trace 数据不能替代关闭 profiling 后的 event timing 结论.
 
 建议主要比较:
 

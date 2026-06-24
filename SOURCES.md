@@ -63,3 +63,13 @@
 3. `README.md`, `RUNNING.md`, `experiment_design.md`
 
   分别覆盖快速开始, 环境搭建与运行, 实验设计和读数方式.
+
+## 5. Device profiling
+
+1. [torch_npu.profiler.profile 官方接口说明](https://www.hiascend.com/document/detail/zh/Pytorch/60RC2/apiref/apilist/ptaoplist_000922.html)
+
+  说明 `activities`, `schedule`, `on_trace_ready` 和常用采集开关.
+
+2. [Ascend PyTorch Profiler 接口采集说明](https://www.hiascend.com/document/detail/zh/canncommercial/80RC22/devaids/auxiliarydevtool/atlasprofiling_16_0038.html)
+
+  提供 `profile`, `schedule`, `tensorboard_trace_handler` 和 `prof.step()` 的完整采集示例.

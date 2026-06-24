@@ -27,6 +27,7 @@ INPUT_DIR = ARTIFACT_DIR / "inputs"
 OUTPUT_DIR = ARTIFACT_DIR / "outputs"
 RESULT_DIR = ARTIFACT_DIR / "results"
 PLOT_DIR = ARTIFACT_DIR / "plots"
+PROFILE_DIR = ARTIFACT_DIR / "profiles"
 METADATA_PATH = ARTIFACT_DIR / "metadata.json"
 
 TENSOR_NAMES = [
@@ -99,6 +100,17 @@ def parse_args() -> argparse.Namespace:
     run_case.add_argument("--warmup", type=int, default=20)
     run_case.add_argument("--repeat", type=int, default=100)
     run_case.add_argument(
+        "--profile",
+        action="store_true",
+        help="Profile the operation after warmup instead of collecting timing samples.",
+    )
+    run_case.add_argument(
+        "--profile-repeat",
+        type=int,
+        default=None,
+        help="Profile iterations. Defaults to --repeat when omitted.",
+    )
+    run_case.add_argument(
         "--output",
         default=str(RESULT_DIR / "timing.csv"),
         help="CSV path for timing samples.",
@@ -163,6 +175,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     OUTPUT_DIR.mkdir()
     RESULT_DIR.mkdir()
     PLOT_DIR.mkdir()
+    PROFILE_DIR.mkdir()
 
     cfg["weight_source"] = resolve_weight_source(torch, cfg, args)
     try:
@@ -414,8 +427,11 @@ def cmd_run_case(args: argparse.Namespace) -> int:
     cfg = make_bench_config(cfg_dict, args)
     bench.validate_config(cfg)
     bench.ensure_vllm_custom_op(torch, cfg)
+    profile_repeat = resolve_profile_repeat(args)
+    profile_dir = PROFILE_DIR / args.case_name
     tracked_paths = run_case_tracked_paths(args, cfg.world_size)
     before_files = snapshot_paths(tracked_paths)
+    before_profile_files = snapshot_tree(profile_dir) if args.profile else {}
     runtime = bench.init_distributed(torch, dist, cfg.world_size)
     if runtime.world_size != cfg.world_size:
         raise ValueError(
@@ -465,6 +481,36 @@ def cmd_run_case(args: argparse.Namespace) -> int:
             metadata,
         )
 
+    if args.profile:
+        profile_operation(
+            torch,
+            torch_npu,
+            operation,
+            args.warmup,
+            profile_repeat,
+            profile_dir,
+            runtime.rank,
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+        if bench.is_primary_rank(torch):
+            print(
+                f"profiled case={args.case_name} op_path={args.op_path} "
+                f"warmup={args.warmup} profile_repeat={profile_repeat} "
+                f"output={profile_dir}"
+            )
+            print_file_change_summary(
+                classify_file_changes(
+                    {**before_files, **before_profile_files},
+                    {
+                        **snapshot_paths(tracked_paths),
+                        **snapshot_tree(profile_dir),
+                    },
+                    set(),
+                )
+            )
+        return 0
+
     samples_ms = bench.measure(torch, cfg, operation)
     summary = bench.summarize(samples_ms)
     if bench.is_primary_rank(torch):
@@ -500,6 +546,8 @@ def launch_torchrun(args: argparse.Namespace) -> int:
     metadata = load_metadata()
     tracked_paths = run_case_tracked_paths(args, int(metadata["config"]["world_size"]))
     before_files = snapshot_paths(tracked_paths)
+    profile_dir = PROFILE_DIR / args.case_name
+    before_profile_files = snapshot_tree(profile_dir) if args.profile else {}
     script = Path(__file__).resolve()
     forwarded = [arg for arg in sys.argv[1:] if arg != "--no-torchrun"]
     cmd = [
@@ -517,9 +565,12 @@ def launch_torchrun(args: argparse.Namespace) -> int:
     if result.returncode != 0:
         print_file_change_summary(
             classify_file_changes(
-                before_files,
-                snapshot_paths(tracked_paths),
-                {resolve_output_path(args.output)},
+                {**before_files, **before_profile_files},
+                {
+                    **snapshot_paths(tracked_paths),
+                    **(snapshot_tree(profile_dir) if args.profile else {}),
+                },
+                set() if args.profile else {resolve_output_path(args.output)},
             )
         )
     return result.returncode
@@ -589,6 +640,60 @@ def check_determinism(torch, operation, repeat: int) -> dict[str, Any]:
         "max_rel_diff": max_rel,
         "reference_output": reference,
     }
+
+
+def resolve_profile_repeat(args: argparse.Namespace) -> int:
+    if args.profile_repeat is not None and not args.profile:
+        raise ValueError("--profile-repeat requires --profile")
+    repeat = args.repeat if args.profile_repeat is None else args.profile_repeat
+    if args.profile and repeat < 1:
+        raise ValueError("--profile-repeat must be >= 1")
+    return int(repeat)
+
+
+def profile_operation(
+    torch,
+    torch_npu,
+    operation,
+    warmup: int,
+    profile_repeat: int,
+    output_dir: Path,
+    rank: int,
+) -> None:
+    for _ in range(int(warmup)):
+        operation()
+    torch.npu.synchronize()
+
+    rank_output_dir = output_dir / f"rank_{rank}"
+    rank_output_dir.mkdir(parents=True, exist_ok=True)
+    activities = [
+        torch_npu.profiler.ProfilerActivity.CPU,
+        torch_npu.profiler.ProfilerActivity.NPU,
+    ]
+    schedule = torch_npu.profiler.schedule(
+        wait=0,
+        warmup=0,
+        active=profile_repeat,
+        repeat=1,
+    )
+    trace_handler = torch_npu.profiler.tensorboard_trace_handler(
+        str(rank_output_dir),
+        worker_name=f"rank_{rank}",
+    )
+    with torch_npu.profiler.profile(
+        activities=activities,
+        schedule=schedule,
+        on_trace_ready=trace_handler,
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+        with_modules=False,
+        with_flops=False,
+    ) as prof:
+        for _ in range(profile_repeat):
+            operation()
+            prof.step()
+        torch.npu.synchronize()
 
 
 def compare_tensors(torch, expected, actual, rtol: float, atol: float) -> dict[str, Any]:
@@ -1185,7 +1290,7 @@ def rank_input_path(rank: int) -> Path:
 
 
 def run_case_tracked_paths(args: argparse.Namespace, world_size: int) -> list[Path]:
-    paths = [resolve_output_path(args.output)]
+    paths = [] if args.profile else [resolve_output_path(args.output)]
     if args.dump_output:
         paths.extend(OUTPUT_DIR / args.case_name / f"rank{rank}.pt" for rank in range(world_size))
     return paths
